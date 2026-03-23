@@ -17,6 +17,7 @@ from svg_utils import decode_to_svg, reconstruct_svg
 def flow_matching_loss(model, batch, device):
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
+    segment_ids = batch["segment_ids"].to(device)
     coord_mask = batch["coord_mask"].to(device)
     coord_values = batch["coord_values"].to(device)
 
@@ -26,7 +27,7 @@ def flow_matching_loss(model, batch, device):
     noisy = (1 - t.unsqueeze(1)) * noise + t.unsqueeze(1) * coord_values
     target_v = coord_values - noise
 
-    pred_v = model(input_ids, attention_mask, noisy, coord_mask, t)
+    pred_v = model(input_ids, attention_mask, segment_ids, noisy, coord_mask, t)
     return ((pred_v - target_v) ** 2 * coord_mask.float()).sum() / coord_mask.float().sum()
 
 
@@ -69,6 +70,7 @@ def reconstruct_samples(model, val_loader, device, epoch, num_samples=10,
             all_items.append({
                 "input_ids": batch["input_ids"][i],
                 "attention_mask": batch["attention_mask"][i],
+                "segment_ids": batch["segment_ids"][i],
                 "coord_mask": batch["coord_mask"][i],
                 "coord_values": batch["coord_values"][i],
                 "coord_offset": batch["coord_offset"][i].item(),
@@ -97,8 +99,9 @@ def reconstruct_samples(model, val_loader, device, epoch, num_samples=10,
         # Model reconstruction: sample, then extract at mask positions
         ids = item["input_ids"].unsqueeze(0).to(device)
         attn = item["attention_mask"].unsqueeze(0).to(device)
+        seg = item["segment_ids"].unsqueeze(0).to(device)
         cmask = item["coord_mask"].unsqueeze(0).to(device)
-        pred_all = model.sample(ids, attn, cmask, num_steps=50)
+        pred_all = model.sample(ids, attn, seg, cmask, num_steps=50)
         pred_norm = pred_all[0][item["coord_mask"]].cpu().tolist()
         pred_svg_xml = decode_to_svg(reconstruct_svg(skeleton, pred_norm, offset, scale))
 
@@ -158,13 +161,20 @@ def main():
         "lora_r": 16,
         "lora_alpha": 32,
         "max_seq_len": 512,
+        "max_prompt_len": 64,
         "val_split": 0.05,
     }
 
     wandb.init(project="svg-diffusion", config=config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = setup_tokenizer(config["model_name"])
-    full_loader = create_dataloader(tokenizer, max_samples=config["max_samples"], batch_size=config["batch_size"], max_seq_len=config["max_seq_len"])
+    full_loader = create_dataloader(
+        tokenizer,
+        max_samples=config["max_samples"],
+        batch_size=config["batch_size"],
+        max_seq_len=config["max_seq_len"],
+        max_prompt_len=config["max_prompt_len"],
+    )
 
     dataset = full_loader.dataset
     val_size = max(1, int(len(dataset) * config["val_split"]))

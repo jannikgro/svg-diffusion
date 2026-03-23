@@ -55,32 +55,46 @@ class SVGDiffusionModel(nn.Module):
             base = MarkupLMModel(model_name_or_config)
         else:
             base = _load_markuplm(model_name_or_config)
+        original_vocab_size = base.get_input_embeddings().num_embeddings
         base.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         h = base.config.hidden_size
 
         lora_config = LoraConfig(r=lora_r, lora_alpha=lora_alpha, target_modules=["query", "value"], lora_dropout=lora_dropout, bias="none")
         self.encoder = get_peft_model(base, lora_config)
         self.coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
+        self.svg_token_start = original_vocab_size
 
+        # PEFT freezes the base embedding table, but our SVG tokens were just
+        # appended and would otherwise stay random forever. Re-enable gradients
+        # and mask them so only the newly added rows are updated.
+        embedding = self.encoder.get_input_embeddings()
+        embedding.weight.requires_grad = True
+        trainable_rows = torch.zeros(embedding.num_embeddings, 1)
+        trainable_rows[self.svg_token_start:] = 1.0
+        self.register_buffer("trainable_embedding_rows", trainable_rows)
+        embedding.weight.register_hook(lambda grad: grad * self.trainable_embedding_rows)
+
+        self.segment_embed = nn.Embedding(2, h)
         self.coord_proj = nn.Sequential(nn.Linear(1, h), nn.GELU(), nn.Linear(h, h))
         self.time_embed = nn.Sequential(SinusoidalEmbedding(h), nn.Linear(h, h), nn.GELU(), nn.Linear(h, h))
         self.coord_head = nn.Sequential(nn.Linear(h, h), nn.GELU(), nn.Linear(h, 1))
 
-    def forward(self, input_ids, attention_mask, noisy_coords, coord_mask, timestep):
+    def forward(self, input_ids, attention_mask, segment_ids, noisy_coords, coord_mask, timestep):
         embeds = self.encoder.get_input_embeddings()(input_ids)
+        embeds = embeds + self.segment_embed(segment_ids)
         embeds = embeds + self.coord_proj(noisy_coords.unsqueeze(-1)) * coord_mask.unsqueeze(-1).float()
         embeds = embeds + self.time_embed(timestep).unsqueeze(1)
         hidden = self.encoder(inputs_embeds=embeds, attention_mask=attention_mask).last_hidden_state
         return self.coord_head(hidden).squeeze(-1)
 
     @torch.no_grad()
-    def sample(self, input_ids, attention_mask, coord_mask, num_steps=50):
+    def sample(self, input_ids, attention_mask, segment_ids, coord_mask, num_steps=50):
         """Generate coordinates via Euler integration of the learned flow field."""
         B, L = input_ids.shape
         x = torch.randn(B, L, device=input_ids.device) * coord_mask.float()
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((B,), i * dt, device=input_ids.device)
-            v = self(input_ids, attention_mask, x, coord_mask, t)
+            v = self(input_ids, attention_mask, segment_ids, x, coord_mask, t)
             x = x + dt * v * coord_mask.float()
         return x

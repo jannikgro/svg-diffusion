@@ -108,17 +108,17 @@ class TestHFTokenizer:
 
 class TestProcessSample:
     def test_basic(self, tokenizer):
-        result = process_svg_sample(SAMPLE_SVG, tokenizer)
+        result = process_svg_sample(SAMPLE_SVG, tokenizer, description="draw a red path")
         assert result is not None
         assert sum(result["coord_mask"]) == 4
 
     def test_circle(self, tokenizer):
-        result = process_svg_sample(SHORT_SVG, tokenizer)
+        result = process_svg_sample(SHORT_SVG, tokenizer, description="a red circle")
         assert result is not None
         assert sum(result["coord_mask"]) == 3
 
     def test_coord_values_at_mask_positions(self, tokenizer):
-        result = process_svg_sample(SAMPLE_SVG, tokenizer)
+        result = process_svg_sample(SAMPLE_SVG, tokenizer, description="draw a red path")
         for mask_val, coord_val in zip(result["coord_mask"], result["coord_values"]):
             if not mask_val:
                 assert coord_val == 0.0
@@ -127,36 +127,53 @@ class TestProcessSample:
         result = process_svg_sample("[<|START_OF_SVG|>][<|END_OF_SVG|>]", tokenizer)
         assert result is None
 
+    def test_prompt_segment_comes_first(self, tokenizer):
+        result = process_svg_sample(SAMPLE_SVG, tokenizer, description="red zig zag icon")
+        coord_positions = [i for i, flag in enumerate(result["coord_mask"]) if flag]
+        assert coord_positions
+        assert all(result["segment_ids"][i] == 1 for i in coord_positions)
+        assert 0 in result["segment_ids"][:coord_positions[0]]
+        assert 1 in result["segment_ids"]
+
 
 class TestDataset:
     def test_dataset_len(self, tokenizer):
-        s = process_svg_sample(SAMPLE_SVG, tokenizer)
+        s = process_svg_sample(SAMPLE_SVG, tokenizer, description="draw a red path")
         ds = SVGDataset([s])
         assert len(ds) == 1
 
     def test_dataset_tensors(self, tokenizer):
-        s = process_svg_sample(SAMPLE_SVG, tokenizer)
+        s = process_svg_sample(SAMPLE_SVG, tokenizer, description="draw a red path")
         ds = SVGDataset([s])
         item = ds[0]
         assert item["input_ids"].dtype == torch.long
+        assert item["segment_ids"].dtype == torch.long
         assert item["coord_mask"].dtype == torch.bool
         assert item["coord_values"].dtype == torch.float32
 
     def test_collate_padding(self, tokenizer):
-        s1 = process_svg_sample(SAMPLE_SVG, tokenizer)
-        s2 = process_svg_sample(SHORT_SVG, tokenizer)
+        s1 = process_svg_sample(SAMPLE_SVG, tokenizer, description="draw a red path")
+        s2 = process_svg_sample(SHORT_SVG, tokenizer, description="a red circle")
         ds = SVGDataset([s1, s2])
         collate_fn = make_collate_fn(tokenizer.pad_token_id)
         batch = collate_fn([ds[0], ds[1]])
         assert batch["input_ids"].shape[0] == 2
         expected_len = max(len(s1["input_ids"]), len(s2["input_ids"]))
         assert batch["input_ids"].shape[1] == expected_len
+        assert batch["segment_ids"].shape == batch["input_ids"].shape
         assert batch["attention_mask"][1, -1].item() == 0
 
 
-@pytest.fixture(scope="module")
-def small_config():
-    return MarkupLMConfig(vocab_size=200, hidden_size=64, num_hidden_layers=2, num_attention_heads=2, intermediate_size=128, max_position_embeddings=128)
+@pytest.fixture()
+def small_config(tokenizer):
+    return MarkupLMConfig(
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        intermediate_size=128,
+        max_position_embeddings=128,
+    )
 
 
 def _make_batch(tokenizer, B=2, L=20):
@@ -165,9 +182,17 @@ def _make_batch(tokenizer, B=2, L=20):
     input_ids[:, 5] = coord_id
     input_ids[:, 10] = coord_id
     attention_mask = torch.ones(B, L, dtype=torch.long)
+    segment_ids = torch.zeros(B, L, dtype=torch.long)
+    segment_ids[:, 4:] = 1
     coord_mask = (input_ids == coord_id)
     coord_values = torch.rand(B, L) * coord_mask.float()
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "coord_mask": coord_mask, "coord_values": coord_values}
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "segment_ids": segment_ids,
+        "coord_mask": coord_mask,
+        "coord_values": coord_values,
+    }
 
 
 class TestModel:
@@ -179,27 +204,50 @@ class TestModel:
     def test_forward_shape(self, small_config, tokenizer):
         model = SVGDiffusionModel(small_config, tokenizer)
         batch = _make_batch(tokenizer)
-        pred = model(batch["input_ids"], batch["attention_mask"], batch["coord_values"], batch["coord_mask"], torch.rand(2))
+        pred = model(
+            batch["input_ids"],
+            batch["attention_mask"],
+            batch["segment_ids"],
+            batch["coord_values"],
+            batch["coord_mask"],
+            torch.rand(2),
+        )
         assert pred.shape == (2, 20)
 
     def test_sample_shape(self, small_config, tokenizer):
         model = SVGDiffusionModel(small_config, tokenizer)
         batch = _make_batch(tokenizer, B=1, L=15)
-        result = model.sample(batch["input_ids"], batch["attention_mask"], batch["coord_mask"], num_steps=3)
+        result = model.sample(batch["input_ids"], batch["attention_mask"], batch["segment_ids"], batch["coord_mask"], num_steps=3)
         assert result.shape == (1, 15)
 
     def test_lora_params_trainable(self, small_config, tokenizer):
         model = SVGDiffusionModel(small_config, tokenizer)
         trainable = [n for n, p in model.named_parameters() if p.requires_grad]
         assert any("lora" in n for n in trainable)
+        assert any("segment_embed" in n for n in trainable)
         assert any("coord_proj" in n for n in trainable)
         assert any("coord_head" in n for n in trainable)
         assert any("time_embed" in n for n in trainable)
 
-    def test_base_frozen(self, small_config, tokenizer):
+    def test_base_backbone_still_frozen(self, small_config, tokenizer):
         model = SVGDiffusionModel(small_config, tokenizer)
         frozen = [n for n, p in model.named_parameters() if not p.requires_grad]
-        assert any("word_embeddings" in n for n in frozen)
+        assert any("encoder.layer" in n for n in frozen)
+
+    def test_only_added_svg_embeddings_receive_gradients(self, small_config, tokenizer):
+        model = SVGDiffusionModel(small_config, tokenizer)
+        sample = process_svg_sample(SAMPLE_SVG, tokenizer, description="draw a red path")
+        ds = SVGDataset([sample])
+        collate_fn = make_collate_fn(tokenizer.pad_token_id)
+        batch = collate_fn([ds[0]])
+
+        loss = flow_matching_loss(model, batch, "cpu")
+        loss.backward()
+
+        grad = model.encoder.get_input_embeddings().weight.grad
+        assert grad is not None
+        assert grad[:model.svg_token_start].abs().sum().item() == 0.0
+        assert grad[model.svg_token_start:].abs().sum().item() > 0.0
 
 
 class TestTraining:
@@ -217,6 +265,7 @@ class TestTraining:
         batch = _make_batch(tokenizer)
         losses = []
         for _ in range(20):
+            torch.manual_seed(1234)
             loss = flow_matching_loss(model, batch, "cpu")
             optimizer.zero_grad()
             loss.backward()
@@ -225,8 +274,8 @@ class TestTraining:
         assert sum(losses[-5:]) / 5 < sum(losses[:5]) / 5
 
     def test_end_to_end_with_real_svg(self, small_config, tokenizer):
-        s1 = process_svg_sample(SAMPLE_SVG, tokenizer)
-        s2 = process_svg_sample(SHORT_SVG, tokenizer)
+        s1 = process_svg_sample(SAMPLE_SVG, tokenizer, description="draw a red path")
+        s2 = process_svg_sample(SHORT_SVG, tokenizer, description="a red circle")
         ds = SVGDataset([s1, s2])
         collate_fn = make_collate_fn(tokenizer.pad_token_id)
         batch = collate_fn([ds[0], ds[1]])

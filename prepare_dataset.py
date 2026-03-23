@@ -13,20 +13,59 @@ def setup_tokenizer(model_name="microsoft/markuplm-base"):
     return tokenizer
 
 
-def process_svg_sample(svg_text, tokenizer, max_seq_len=512, description=""):
+def _sanitize_prompt_text(prompt_text):
+    """Prevent reserved SVG tokens from appearing in the prompt segment."""
+    sanitized = prompt_text or ""
+    for token in [COORD_TOKEN] + SVG_SEMANTIC_TOKENS:
+        if token in sanitized:
+            sanitized = sanitized.replace(token, token.replace("[", "(").replace("]", ")"))
+    return sanitized
+
+
+def _build_prompt_svg_pair(tokenizer, prompt_ids, svg_ids, max_seq_len):
+    """Build a prompt-first / SVG-second pair sequence and explicit segment IDs."""
+    special_tokens = tokenizer.num_special_tokens_to_add(pair=True)
+    prompt_budget = max(0, max_seq_len - special_tokens)
+    prompt_ids = prompt_ids[:prompt_budget]
+    svg_budget = max_seq_len - len(prompt_ids) - special_tokens
+    svg_ids = svg_ids[:max(0, svg_budget)]
+
+    input_ids = tokenizer.build_inputs_with_special_tokens(prompt_ids, svg_ids)
+    attention_mask = [1] * len(input_ids)
+    special_mask = tokenizer.get_special_tokens_mask(input_ids, already_has_special_tokens=True)
+
+    segment_ids = []
+    prompt_tokens_seen = 0
+    svg_started = False
+    for is_special in special_mask:
+        if is_special:
+            segment_ids.append(1 if svg_started else 0)
+        elif prompt_tokens_seen < len(prompt_ids):
+            segment_ids.append(0)
+            prompt_tokens_seen += 1
+        else:
+            svg_started = True
+            segment_ids.append(1)
+
+    return input_ids, attention_mask, segment_ids
+
+
+def process_svg_sample(svg_text, tokenizer, max_seq_len=512, description="", max_prompt_len=64):
     """Process a single encoded SVG string into tensors for training.
 
-    Returns a dict with input_ids, attention_mask, coord_mask, and coord_values,
-    or None if the sample should be skipped.
+    Encodes the prompt as the first segment and the SVG skeleton as the second.
+    Returns a dict with input_ids, attention_mask, segment_ids, coord_mask, and
+    coord_values, or None if the sample should be skipped.
     """
     skeleton, coords = parse_encoded_svg(svg_text)
     if not coords:
         return None
 
     norm_coords, offset, scale = normalize_coordinates(coords)
-    encoding = tokenizer(skeleton, add_special_tokens=True, truncation=True, max_length=max_seq_len)
-    input_ids = encoding["input_ids"]
-    attention_mask = encoding["attention_mask"]
+    prompt_text = _sanitize_prompt_text(description)
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False, truncation=True, max_length=max_prompt_len)
+    svg_ids = tokenizer.encode(skeleton, add_special_tokens=False)
+    input_ids, attention_mask, segment_ids = _build_prompt_svg_pair(tokenizer, prompt_ids, svg_ids, max_seq_len)
 
     coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
     num_coords_in_ids = sum(1 for tid in input_ids if tid == coord_token_id)
@@ -60,6 +99,7 @@ def process_svg_sample(svg_text, tokenizer, max_seq_len=512, description=""):
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
+        "segment_ids": segment_ids,
         "coord_mask": coord_mask,
         "coord_values": coord_values,
         "coord_offset": offset,
@@ -81,6 +121,7 @@ class SVGDataset(Dataset):
         return {
             "input_ids": torch.tensor(s["input_ids"], dtype=torch.long),
             "attention_mask": torch.tensor(s["attention_mask"], dtype=torch.long),
+            "segment_ids": torch.tensor(s["segment_ids"], dtype=torch.long),
             "coord_mask": torch.tensor(s["coord_mask"], dtype=torch.bool),
             "coord_values": torch.tensor(s["coord_values"], dtype=torch.float32),
             "coord_offset": torch.tensor(s["coord_offset"], dtype=torch.float32),
@@ -93,17 +134,18 @@ class SVGDataset(Dataset):
 def make_collate_fn(pad_token_id):
     """Create a collate function that pads batches to equal length.
 
-    Uses pad_token_id for input_ids, 0 for attention_mask and coord_mask,
-    and 0.0 for coord_values. coord_offset and coord_scale are per-sample
-    scalars and are simply stacked.
+    Uses pad_token_id for input_ids, 0 for attention_mask, segment_ids, and
+    coord_mask, and 0.0 for coord_values. coord_offset and coord_scale are
+    per-sample scalars and are simply stacked.
     """
     def collate_fn(batch):
         max_len = max(b["input_ids"].shape[0] for b in batch)
-        out = {"input_ids": [], "attention_mask": [], "coord_mask": [], "coord_values": []}
+        out = {"input_ids": [], "attention_mask": [], "segment_ids": [], "coord_mask": [], "coord_values": []}
         for b in batch:
             pad = max_len - b["input_ids"].shape[0]
             out["input_ids"].append(F.pad(b["input_ids"], (0, pad), value=pad_token_id))
             out["attention_mask"].append(F.pad(b["attention_mask"], (0, pad), value=0))
+            out["segment_ids"].append(F.pad(b["segment_ids"], (0, pad), value=0))
             out["coord_mask"].append(F.pad(b["coord_mask"], (0, pad), value=False))
             out["coord_values"].append(F.pad(b["coord_values"], (0, pad), value=0.0))
         out = {k: torch.stack(v) for k, v in out.items()}
@@ -115,7 +157,7 @@ def make_collate_fn(pad_token_id):
     return collate_fn
 
 
-def create_dataloader(tokenizer, dataset_name="xingxm/SVGX-SFT-1M", data_file="SVGX_SFT_GEN_51k_encode.json", split="train", max_samples=None, max_seq_len=512, batch_size=8, num_workers=0):
+def create_dataloader(tokenizer, dataset_name="xingxm/SVGX-SFT-1M", data_file="SVGX_SFT_GEN_51k_encode.json", split="train", max_samples=None, max_seq_len=512, max_prompt_len=64, batch_size=8, num_workers=0):
     from tqdm import tqdm
     hf_dataset = load_dataset(dataset_name, split=split, data_files=data_file, streaming=True)
     samples = []
@@ -124,7 +166,7 @@ def create_dataloader(tokenizer, dataset_name="xingxm/SVGX-SFT-1M", data_file="S
             break
         svg_text = item.get("output", "")
         description = item.get("input", "")
-        processed = process_svg_sample(svg_text, tokenizer, max_seq_len=max_seq_len, description=description)
+        processed = process_svg_sample(svg_text, tokenizer, max_seq_len=max_seq_len, description=description, max_prompt_len=max_prompt_len)
         if processed is not None:
             samples.append(processed)
     print(f"Loaded {len(samples)} valid samples (from {i + 1} total)")
