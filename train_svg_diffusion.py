@@ -14,6 +14,35 @@ from model import SVGDiffusionModel
 from svg_utils import decode_to_svg, reconstruct_svg
 
 
+class EMA:
+    """Exponential Moving Average of model parameters."""
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+
+    @torch.no_grad()
+    def update(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.shadow[n].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
+    def apply(self, model):
+        """Swap model params with EMA params; call restore() to undo."""
+        self.backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.backup[n] = p.data.clone()
+                p.data.copy_(self.shadow[n])
+
+    def restore(self, model):
+        """Restore original model params after apply()."""
+        for n, p in model.named_parameters():
+            if n in self.backup:
+                p.data.copy_(self.backup[n])
+        self.backup = {}
+
+
 def flow_matching_loss(model, batch, device):
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -130,25 +159,58 @@ def reconstruct_samples(model, val_loader, device, epoch, num_samples=10,
     model.train()
 
 
-def train(model, train_loader, val_loader, optimizer, device, epochs=10):
+def save_checkpoint(model, optimizer, scheduler, ema, epoch, val_loss, path):
+    """Save a training checkpoint."""
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "ema_shadow": ema.shadow,
+        "val_loss": val_loss,
+    }, path)
+
+
+def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
+          epochs=10, checkpoint_dir="checkpoints", grad_clip=1.0):
     model.train()
     global_step = 0
+    best_val_loss = float("inf")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     for epoch in range(epochs):
         total_loss, count = 0.0, 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
             loss = flow_matching_loss(model, batch, device)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
+            scheduler.step()
+            ema.update(model)
             total_loss += loss.item()
             count += 1
             global_step += 1
-            wandb.log({"train/loss": loss.item(), "step": global_step})
+            wandb.log({"train/loss": loss.item(), "lr": scheduler.get_last_lr()[0], "step": global_step})
         train_loss = total_loss / max(count, 1)
+
+        # Evaluate using EMA weights
+        ema.apply(model)
         val_loss = evaluate(model, val_loader, device)
         wandb.log({"train/epoch_loss": train_loss, "val/loss": val_loss, "epoch": epoch + 1})
         print(f"Epoch {epoch + 1}/{epochs} | Train: {train_loss:.6f} | Val: {val_loss:.6f}")
         reconstruct_samples(model, val_loader, device, epoch + 1)
+        ema.restore(model)
+
+        # Checkpoint: save best and periodic
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(model, optimizer, scheduler, ema, epoch + 1, val_loss,
+                            os.path.join(checkpoint_dir, "best.pt"))
+            print(f"  New best val loss: {val_loss:.6f}")
+
+        save_checkpoint(model, optimizer, scheduler, ema, epoch + 1, val_loss,
+                        os.path.join(checkpoint_dir, "latest.pt"))
 
 
 def main():
@@ -158,11 +220,14 @@ def main():
         "batch_size": 32,
         "lr": 1e-4,
         "epochs": 1000,
-        "lora_r": 16,
-        "lora_alpha": 32,
+        "lora_r": 32,
+        "lora_alpha": 64,
         "max_seq_len": 512,
         "max_prompt_len": 64,
         "val_split": 0.05,
+        "grad_clip": 1.0,
+        "ema_decay": 0.999,
+        "warmup_epochs": 5,
     }
 
     wandb.init(project="svg-diffusion", config=config)
@@ -190,8 +255,20 @@ def main():
 
     model = SVGDiffusionModel(config["model_name"], tokenizer, lora_r=config["lora_r"], lora_alpha=config["lora_alpha"]).to(device)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=config["lr"])
+
+    # Cosine annealing with linear warmup
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * config["epochs"]
+    warmup_steps = steps_per_epoch * config["warmup_epochs"]
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+
+    ema = EMA(model, decay=config["ema_decay"])
+
     wandb.watch(model, log="gradients", log_freq=50)
-    train(model, train_loader, val_loader, optimizer, device, epochs=config["epochs"])
+    train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
+          epochs=config["epochs"], grad_clip=config["grad_clip"])
     wandb.finish()
 
 
