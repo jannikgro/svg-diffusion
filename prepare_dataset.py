@@ -7,7 +7,9 @@ from svg_utils import COORD_TOKEN, SVG_SEMANTIC_TOKENS, parse_encoded_svg, norma
 
 
 def setup_tokenizer(model_name="microsoft/markuplm-base"):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     special_tokens = [COORD_TOKEN] + SVG_SEMANTIC_TOKENS
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     return tokenizer
@@ -24,38 +26,39 @@ def _sanitize_prompt_text(prompt_text):
 
 def _build_prompt_svg_pair(tokenizer, prompt_ids, svg_ids, max_seq_len):
     """Build a prompt-first / SVG-second pair sequence and explicit segment IDs."""
-    special_tokens = tokenizer.num_special_tokens_to_add(pair=True)
-    prompt_budget = max(0, max_seq_len - special_tokens)
-    prompt_ids = prompt_ids[:prompt_budget]
-    svg_budget = max_seq_len - len(prompt_ids) - special_tokens
-    svg_ids = svg_ids[:max(0, svg_budget)]
+    # Try the BERT-style API (MarkupLM, RoBERTa); fall back to simple
+    # concatenation for causal-LM tokenizers (Phi, LLaMA) that lack it.
+    if hasattr(tokenizer, 'build_inputs_with_special_tokens'):
+        special_tokens = tokenizer.num_special_tokens_to_add(pair=True)
+        prompt_budget = max(0, max_seq_len - special_tokens)
+        prompt_ids = prompt_ids[:prompt_budget]
+        svg_budget = max_seq_len - len(prompt_ids) - special_tokens
+        svg_ids = svg_ids[:max(0, svg_budget)]
+        input_ids = tokenizer.build_inputs_with_special_tokens(prompt_ids, svg_ids)
+    else:
+        prompt_ids = prompt_ids[:max_seq_len]
+        svg_budget = max(0, max_seq_len - len(prompt_ids))
+        svg_ids = svg_ids[:svg_budget]
+        input_ids = prompt_ids + svg_ids
 
-    input_ids = tokenizer.build_inputs_with_special_tokens(prompt_ids, svg_ids)
     attention_mask = [1] * len(input_ids)
-    special_mask = tokenizer.get_special_tokens_mask(input_ids, already_has_special_tokens=True)
 
-    segment_ids = []
-    prompt_tokens_seen = 0
-    svg_started = False
-    for is_special in special_mask:
-        if is_special:
-            segment_ids.append(1 if svg_started else 0)
-        elif prompt_tokens_seen < len(prompt_ids):
-            segment_ids.append(0)
-            prompt_tokens_seen += 1
-        else:
-            svg_started = True
-            segment_ids.append(1)
+    # Build segment IDs: 0 for prompt region, 1 for SVG region.
+    # Works whether or not special tokens were inserted.
+    segment_ids = [0] * len(prompt_ids) + [1] * (len(input_ids) - len(prompt_ids))
 
     return input_ids, attention_mask, segment_ids
 
 
-def process_svg_sample(svg_text, tokenizer, max_seq_len=512, description="", max_prompt_len=64):
+def process_svg_sample(svg_text, tokenizer, max_seq_len=512, description="", max_prompt_len=64, max_token_len=None):
     """Process a single encoded SVG string into tensors for training.
 
     Encodes the prompt as the first segment and the SVG skeleton as the second.
     Returns a dict with input_ids, attention_mask, segment_ids, coord_mask, and
     coord_values, or None if the sample should be skipped.
+
+    If *max_token_len* is set, samples whose total token count exceeds it are
+    skipped (returns None).
     """
     skeleton, coords = parse_encoded_svg(svg_text)
     if not coords:
@@ -65,6 +68,10 @@ def process_svg_sample(svg_text, tokenizer, max_seq_len=512, description="", max
     prompt_text = _sanitize_prompt_text(description)
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False, truncation=True, max_length=max_prompt_len)
     svg_ids = tokenizer.encode(skeleton, add_special_tokens=False)
+
+    if max_token_len is not None and len(prompt_ids) + len(svg_ids) > max_token_len:
+        return None
+
     input_ids, attention_mask, segment_ids = _build_prompt_svg_pair(tokenizer, prompt_ids, svg_ids, max_seq_len)
 
     coord_token_id = tokenizer.convert_tokens_to_ids(COORD_TOKEN)
@@ -157,7 +164,16 @@ def make_collate_fn(pad_token_id):
     return collate_fn
 
 
-def create_dataloader(tokenizer, dataset_name="xingxm/SVGX-SFT-1M", data_file="SVGX_SFT_GEN_51k_encode.json", split="train", max_samples=None, max_seq_len=512, max_prompt_len=64, batch_size=8, num_workers=0):
+def collate_single(batch):
+    """Collate for batch_size=1 — adds the batch dimension, no padding."""
+    item = batch[0]
+    return {
+        k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else [v]
+        for k, v in item.items()
+    }
+
+
+def create_dataloader(tokenizer, dataset_name="xingxm/SVGX-SFT-1M", data_file="SVGX_SFT_GEN_51k_encode.json", split="train", max_samples=None, max_seq_len=512, max_prompt_len=64, max_token_len=None, batch_size=8, num_workers=0):
     from tqdm import tqdm
     hf_dataset = load_dataset(dataset_name, split=split, data_files=data_file, streaming=True)
     samples = []
@@ -166,7 +182,7 @@ def create_dataloader(tokenizer, dataset_name="xingxm/SVGX-SFT-1M", data_file="S
             break
         svg_text = item.get("output", "")
         description = item.get("input", "")
-        processed = process_svg_sample(svg_text, tokenizer, max_seq_len=max_seq_len, description=description, max_prompt_len=max_prompt_len)
+        processed = process_svg_sample(svg_text, tokenizer, max_seq_len=max_seq_len, description=description, max_prompt_len=max_prompt_len, max_token_len=max_token_len)
         if processed is not None:
             samples.append(processed)
     print(f"Loaded {len(samples)} valid samples (from {i + 1} total)")

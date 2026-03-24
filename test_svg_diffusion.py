@@ -1,7 +1,7 @@
 import pytest
 import torch
 from transformers import MarkupLMConfig
-from svg_utils import COORD_TOKEN, parse_encoded_svg, normalize_coordinates, denormalize_coordinates, reconstruct_svg, _tokenize_encoded_svg
+from svg_utils import COORD_TOKEN, SVG_SEMANTIC_TOKENS, parse_encoded_svg, normalize_coordinates, denormalize_coordinates, reconstruct_svg, _tokenize_encoded_svg
 from prepare_dataset import setup_tokenizer, process_svg_sample, SVGDataset, make_collate_fn
 from model import SVGDiffusionModel, SinusoidalEmbedding
 from train_svg_diffusion import flow_matching_loss
@@ -104,6 +104,24 @@ class TestHFTokenizer:
         tok_id = tokenizer.convert_tokens_to_ids(tok)
         ids = tokenizer.encode(tok, add_special_tokens=False)
         assert ids == [tok_id]
+
+
+@pytest.fixture(scope="module")
+def phi_tokenizer():
+    return setup_tokenizer("microsoft/Phi-4-mini-instruct")
+
+
+class TestPhiTokenizer:
+    def test_all_svg_tokens_atomic(self, phi_tokenizer):
+        """Every SVG control token must encode to exactly one token ID,
+        ensuring the model sees them as single units, not subword fragments."""
+        for tok in [COORD_TOKEN] + SVG_SEMANTIC_TOKENS:
+            tok_id = phi_tokenizer.convert_tokens_to_ids(tok)
+            ids = phi_tokenizer.encode(tok, add_special_tokens=False)
+            assert ids == [tok_id], (
+                f"Token {tok!r} is not atomic: encode produced {ids} "
+                f"(expected [{tok_id}])"
+            )
 
 
 class TestProcessSample:
