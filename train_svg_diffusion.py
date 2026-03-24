@@ -4,7 +4,7 @@ import random
 
 import torch
 import wandb
-from tqdm import tqdm
+import time
 import matplotlib.pyplot as plt
 from PIL import Image
 import cairosvg
@@ -172,8 +172,8 @@ def save_checkpoint(model, optimizer, scheduler, ema, epoch, val_loss, path):
 
 
 def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
-          epochs=10, checkpoint_dir="checkpoints", grad_clip=1.0,
-          accumulation_steps=1, eval_every=500):
+          epochs=10, checkpoint_dir="checkpoints", reconstruction_dir="reconstructions",
+          grad_clip=1.0, accumulation_steps=1, eval_every=500):
     model.train()
     global_step = 0
     best_val_loss = float("inf")
@@ -184,9 +184,11 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
         ema.apply(model)
         val_loss = evaluate(model, val_loader, device)
         wandb.log({"val/loss": val_loss, "step": global_step})
-        print(f"  Step {global_step} | Val: {val_loss:.6f}")
+        print(f"  Step {global_step} | Val: {val_loss:.6f} | Train loss: {last_loss:.4f} | "
+              f"Grad norm: {last_grad_norm:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | "
+              f"Speed: {last_speed:.2f} it/s")
         reconstruct_samples(model, val_loader, device, global_step,
-                            out_dir="reconstructions")
+                            out_dir=reconstruction_dir)
         ema.restore(model)
 
         if val_loss < best_val_loss:
@@ -199,11 +201,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
                         os.path.join(checkpoint_dir, "latest.pt"))
         model.train()
 
+    last_loss, last_grad_norm, last_speed = 0.0, 0.0, 0.0
+    step_t0 = time.monotonic()
+
     for epoch in range(epochs):
         total_loss, count = 0.0, 0
         optimizer.zero_grad()
-        opt_steps_in_epoch = (len(train_loader) + accumulation_steps - 1) // accumulation_steps
-        pbar = tqdm(total=opt_steps_in_epoch, desc=f"Epoch {epoch + 1}/{epochs}")
         for i, batch in enumerate(train_loader):
             loss = flow_matching_loss(model, batch, device)
             (loss / accumulation_steps).backward()
@@ -211,20 +214,32 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
             count += 1
 
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                 optimizer.step()
                 scheduler.step()
                 ema.update(model)
                 optimizer.zero_grad()
                 global_step += 1
-                pbar.update(1)
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
-                wandb.log({"train/step_loss": loss.item(), "lr": scheduler.get_last_lr()[0], "step": global_step})
+
+                now = time.monotonic()
+                last_speed = 1.0 / max(now - step_t0, 1e-9)
+                step_t0 = now
+                last_loss = loss.item()
+                last_grad_norm = grad_norm.item()
+
+                clipped = 1.0 if last_grad_norm > grad_clip else 0.0
+                wandb.log({
+                    "train/step_loss": last_loss,
+                    "train/grad_norm": last_grad_norm,
+                    "train/grad_clipped": clipped,
+                    "train/speed": last_speed,
+                    "lr": scheduler.get_last_lr()[0],
+                    "step": global_step,
+                })
 
                 if global_step % eval_every == 0:
                     _eval_and_checkpoint()
 
-        pbar.close()
         train_loss = total_loss / max(count, 1)
         wandb.log({"train/epoch_loss": train_loss, "epoch": epoch + 1})
         print(f"Epoch {epoch + 1}/{epochs} | Train: {train_loss:.6f}")
@@ -235,18 +250,24 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
 
 
 def main():
+    run_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+    checkpoint_dir = f"checkpoints/{run_id}"
+    reconstruction_dir = f"reconstructions/{run_id}"
+
     config = {
         "model_name": "microsoft/Phi-4-mini-instruct",
-        "max_samples": 100000,
+        "max_samples": None,
         "accumulation_steps": 32,
-        "lr": 1e-4,
+        "lr": 5e-5,
         "epochs": 1000,
         "lora_r": 32,
         "lora_alpha": 64,
+        "lora_targets": ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"],
+        "weight_decay": 0.01,
         "val_split": 0.05,
         "grad_clip": 1.0,
         "ema_decay": 0.999,
-        "warmup_epochs": 5,
+        "warmup_epochs": 2,
         "eval_every": 500,
         "max_token_len": 2048,
     }
@@ -276,14 +297,14 @@ def main():
 
     print(f"Train: {train_size} samples ({len(train_loader)} batches) | Val: {val_size} samples ({len(val_loader)} batches)")
 
-    model = SVGDiffusionModel(config["model_name"], tokenizer, lora_r=config["lora_r"], lora_alpha=config["lora_alpha"]).to(device)
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=config["lr"])
+    model = SVGDiffusionModel(config["model_name"], tokenizer, lora_r=config["lora_r"], lora_alpha=config["lora_alpha"], lora_targets=config["lora_targets"]).to(device)
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=config["lr"], weight_decay=config["weight_decay"])
 
     # Cosine annealing with linear warmup (counted in optimizer steps, not samples)
     optimizer_steps_per_epoch = (len(train_loader) + config["accumulation_steps"] - 1) // config["accumulation_steps"]
     total_steps = optimizer_steps_per_epoch * config["epochs"]
     warmup_steps = optimizer_steps_per_epoch * config["warmup_epochs"]
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, total_iters=warmup_steps)
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
     scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
@@ -291,7 +312,8 @@ def main():
 
     wandb.watch(model, log="gradients", log_freq=50)
     train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
-          epochs=config["epochs"], grad_clip=config["grad_clip"],
+          epochs=config["epochs"], checkpoint_dir=checkpoint_dir,
+          reconstruction_dir=reconstruction_dir, grad_clip=config["grad_clip"],
           accumulation_steps=config["accumulation_steps"],
           eval_every=config["eval_every"])
     wandb.finish()
