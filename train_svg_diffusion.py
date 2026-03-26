@@ -258,7 +258,7 @@ def main():
         "model_name": "microsoft/Phi-4-mini-instruct",
         "max_samples": None,
         "accumulation_steps": 32,
-        "lr": 5e-5,
+        "lr": 2e-4,
         "epochs": 1000,
         "lora_r": 32,
         "lora_alpha": 64,
@@ -267,7 +267,7 @@ def main():
         "val_split": 0.05,
         "grad_clip": 1.0,
         "ema_decay": 0.999,
-        "warmup_epochs": 2,
+        "warmup_epochs": 0.5,
         "eval_every": 500,
         "max_token_len": 2048,
     }
