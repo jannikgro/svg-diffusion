@@ -7,4 +7,4 @@
 #SBATCH --output=slurm-%j.log
 
 cd /home/jgroenev/repositories/svg_diffusion
-python train_svg_diffusion.py
+python train_svg_diffusion.py --resume /home/jgroenev/repositories/svg_diffusion/checkpoints/559272

@@ -1,3 +1,4 @@
+import argparse
 import io
 import os
 import random
@@ -5,6 +6,7 @@ import random
 import torch
 import wandb
 import time
+import yaml
 import matplotlib.pyplot as plt
 from PIL import Image
 import cairosvg
@@ -12,6 +14,49 @@ import cairosvg
 from prepare_dataset import setup_tokenizer, create_dataloader
 from model import SVGDiffusionModel
 from svg_utils import decode_to_svg, reconstruct_svg
+
+LIVE_CONFIG_PATH = "live_config.yaml"
+
+
+def load_live_config():
+    """Load the live configuration file, returning overrides or empty dict."""
+    if os.path.exists(LIVE_CONFIG_PATH):
+        try:
+            with open(LIVE_CONFIG_PATH) as f:
+                cfg = yaml.safe_load(f)
+            return cfg if isinstance(cfg, dict) else {}
+        except Exception as e:
+            print(f"  [live_config] Failed to load: {e}")
+    return {}
+
+
+def apply_live_config(optimizer, config, global_step):
+    """Reload live_config.yaml and apply supported hyperparameter changes."""
+    live = load_live_config()
+    if not live:
+        return
+
+    changed = []
+    if "lr" in live and live["lr"] != config.get("_live_lr"):
+        for pg in optimizer.param_groups:
+            pg["lr"] = live["lr"]
+        config["_live_lr"] = live["lr"]
+        changed.append(f"lr={live['lr']}")
+
+    if "grad_clip" in live and live["grad_clip"] != config.get("grad_clip"):
+        config["grad_clip"] = live["grad_clip"]
+        changed.append(f"grad_clip={live['grad_clip']}")
+
+    if "eval_every" in live and live["eval_every"] != config.get("eval_every"):
+        config["eval_every"] = live["eval_every"]
+        changed.append(f"eval_every={live['eval_every']}")
+
+    if "ema_decay" in live and live["ema_decay"] != config.get("ema_decay"):
+        config["ema_decay"] = live["ema_decay"]
+        changed.append(f"ema_decay={live['ema_decay']}")
+
+    if changed:
+        print(f"  [live_config] Step {global_step}: updated {', '.join(changed)}")
 
 
 class EMA:
@@ -159,33 +204,36 @@ def reconstruct_samples(model, val_loader, device, step, num_samples=10,
     model.train()
 
 
-def save_checkpoint(model, optimizer, scheduler, ema, epoch, val_loss, path):
+def save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_loss, config, path):
     """Save a training checkpoint."""
     torch.save({
+        "global_step": global_step,
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "ema_shadow": ema.shadow,
         "val_loss": val_loss,
+        "config": config,
     }, path)
 
 
 def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
-          epochs=10, checkpoint_dir="checkpoints", reconstruction_dir="reconstructions",
-          grad_clip=1.0, accumulation_steps=1, eval_every=500):
+          config, epochs=10, checkpoint_dir="checkpoints", reconstruction_dir="reconstructions",
+          grad_clip=1.0, accumulation_steps=1, eval_every=500,
+          start_step=0, start_epoch=0):
     model.train()
-    global_step = 0
+    global_step = start_step
     best_val_loss = float("inf")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    def _eval_and_checkpoint():
+    def _eval_and_checkpoint(epoch):
         nonlocal best_val_loss
         ema.apply(model)
         val_loss = evaluate(model, val_loader, device)
         wandb.log({"val/loss": val_loss, "step": global_step})
         print(f"  Step {global_step} | Val: {val_loss:.6f} | Train loss: {last_loss:.4f} | "
-              f"Grad norm: {last_grad_norm:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | "
+              f"Grad norm: {last_grad_norm:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e} | "
               f"Speed: {last_speed:.2f} it/s")
         reconstruct_samples(model, val_loader, device, global_step,
                             out_dir=reconstruction_dir)
@@ -193,18 +241,18 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(model, optimizer, scheduler, ema, global_step, val_loss,
+            save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_loss, config,
                             os.path.join(checkpoint_dir, "best.pt"))
             print(f"  New best val loss: {val_loss:.6f}")
 
-        save_checkpoint(model, optimizer, scheduler, ema, global_step, val_loss,
+        save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_loss, config,
                         os.path.join(checkpoint_dir, "latest.pt"))
         model.train()
 
     last_loss, last_grad_norm, last_speed = 0.0, 0.0, 0.0
     step_t0 = time.monotonic()
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         total_loss, count = 0.0, 0
         optimizer.zero_grad()
         for i, batch in enumerate(train_loader):
@@ -214,7 +262,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
             count += 1
 
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config["grad_clip"])
                 optimizer.step()
                 scheduler.step()
                 ema.update(model)
@@ -227,29 +275,39 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
                 last_loss = loss.item()
                 last_grad_norm = grad_norm.item()
 
-                clipped = 1.0 if last_grad_norm > grad_clip else 0.0
+                # Reload live config every 100 steps
+                if global_step % 100 == 0:
+                    apply_live_config(optimizer, config, global_step)
+                    ema.decay = config.get("ema_decay", ema.decay)
+
+                clipped = 1.0 if last_grad_norm > config["grad_clip"] else 0.0
                 wandb.log({
                     "train/step_loss": last_loss,
                     "train/grad_norm": last_grad_norm,
                     "train/grad_clipped": clipped,
                     "train/speed": last_speed,
-                    "lr": scheduler.get_last_lr()[0],
+                    "lr": optimizer.param_groups[0]["lr"],
                     "step": global_step,
                 })
 
-                if global_step % eval_every == 0:
-                    _eval_and_checkpoint()
+                if global_step % config["eval_every"] == 0:
+                    _eval_and_checkpoint(epoch)
 
         train_loss = total_loss / max(count, 1)
         wandb.log({"train/epoch_loss": train_loss, "epoch": epoch + 1})
         print(f"Epoch {epoch + 1}/{epochs} | Train: {train_loss:.6f}")
 
         # Also eval at end of epoch if not just evaluated
-        if global_step % eval_every != 0:
-            _eval_and_checkpoint()
+        if global_step % config["eval_every"] != 0:
+            _eval_and_checkpoint(epoch)
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint directory or .pt file to resume from")
+    args = parser.parse_args()
+
     run_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
     checkpoint_dir = f"checkpoints/{run_id}"
     reconstruction_dir = f"reconstructions/{run_id}"
@@ -272,7 +330,22 @@ def main():
         "max_token_len": 2048,
     }
 
-    wandb.init(project="svg-diffusion", config=config)
+    # Resolve resume checkpoint path
+    resume_path = None
+    if args.resume:
+        if os.path.isdir(args.resume):
+            resume_path = os.path.join(args.resume, "latest.pt")
+        else:
+            resume_path = args.resume
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+        # Use the original checkpoint dir when resuming
+        checkpoint_dir = os.path.dirname(resume_path)
+        reconstruction_dir = checkpoint_dir.replace("checkpoints", "reconstructions")
+        print(f"Resuming from {resume_path}")
+
+    wandb.init(project="svg-diffusion", config=config,
+               resume="allow" if resume_path else None)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = setup_tokenizer(config["model_name"])
 
@@ -304,18 +377,50 @@ def main():
     optimizer_steps_per_epoch = (len(train_loader) + config["accumulation_steps"] - 1) // config["accumulation_steps"]
     total_steps = optimizer_steps_per_epoch * config["epochs"]
     warmup_steps = optimizer_steps_per_epoch * config["warmup_epochs"]
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, total_iters=warmup_steps)
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
-    ema = EMA(model, decay=config["ema_decay"])
+    start_step = 0
+    start_epoch = 0
+
+    if resume_path:
+        # No warmup when resuming — just cosine from current position
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        # Don't load old scheduler state — we're using a fresh cosine-only scheduler
+        if "ema_shadow" in ckpt:
+            ema = EMA(model, decay=config["ema_decay"])
+            ema.shadow = ckpt["ema_shadow"]
+        else:
+            ema = EMA(model, decay=config["ema_decay"])
+        start_step = ckpt.get("global_step", 0)
+        start_epoch = ckpt.get("epoch", 0)
+        print(f"Resumed: step={start_step}, epoch={start_epoch}, val_loss={ckpt.get('val_loss', 'N/A')}")
+    else:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, total_iters=warmup_steps)
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+        ema = EMA(model, decay=config["ema_decay"])
+
+    # Write initial live config file if it doesn't exist
+    if not os.path.exists(LIVE_CONFIG_PATH):
+        with open(LIVE_CONFIG_PATH, "w") as f:
+            yaml.dump({
+                "lr": config["lr"],
+                "grad_clip": config["grad_clip"],
+                "eval_every": config["eval_every"],
+                "ema_decay": config["ema_decay"],
+            }, f, default_flow_style=False)
+        print(f"Created {LIVE_CONFIG_PATH} — edit to adjust hyperparameters on the fly")
 
     wandb.watch(model, log="gradients", log_freq=50)
     train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
-          epochs=config["epochs"], checkpoint_dir=checkpoint_dir,
+          config=config, epochs=config["epochs"], checkpoint_dir=checkpoint_dir,
           reconstruction_dir=reconstruction_dir, grad_clip=config["grad_clip"],
           accumulation_steps=config["accumulation_steps"],
-          eval_every=config["eval_every"])
+          eval_every=config["eval_every"],
+          start_step=start_step, start_epoch=start_epoch)
     wandb.finish()
 
 
