@@ -32,6 +32,7 @@ def load_live_config():
 
 def apply_live_config(optimizer, config, global_step):
     """Reload live_config.yaml and apply supported hyperparameter changes."""
+    print(f"  [live_config] Step {global_step}: reloading {LIVE_CONFIG_PATH}")
     live = load_live_config()
     if not live:
         return
@@ -54,6 +55,14 @@ def apply_live_config(optimizer, config, global_step):
     if "ema_decay" in live and live["ema_decay"] != config.get("ema_decay"):
         config["ema_decay"] = live["ema_decay"]
         changed.append(f"ema_decay={live['ema_decay']}")
+
+    if "checkpoint_every" in live and live["checkpoint_every"] != config.get("checkpoint_every"):
+        config["checkpoint_every"] = live["checkpoint_every"]
+        changed.append(f"checkpoint_every={live['checkpoint_every']}")
+
+    if "skip_val" in live and live["skip_val"] != config.get("skip_val"):
+        config["skip_val"] = live["skip_val"]
+        changed.append(f"skip_val={live['skip_val']}")
 
     if changed:
         print(f"  [live_config] Step {global_step}: updated {', '.join(changed)}")
@@ -205,7 +214,8 @@ def reconstruct_samples(model, val_loader, device, step, num_samples=10,
 
 
 def save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_loss, config, path):
-    """Save a training checkpoint."""
+    """Save a training checkpoint atomically to avoid corruption on crash."""
+    tmp_path = path + ".tmp"
     torch.save({
         "global_step": global_step,
         "epoch": epoch,
@@ -215,7 +225,8 @@ def save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_lo
         "ema_shadow": ema.shadow,
         "val_loss": val_loss,
         "config": config,
-    }, path)
+    }, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
@@ -229,24 +240,35 @@ def train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
 
     def _eval_and_checkpoint(epoch):
         nonlocal best_val_loss
-        ema.apply(model)
-        val_loss = evaluate(model, val_loader, device)
-        wandb.log({"val/loss": val_loss, "step": global_step})
-        print(f"  Step {global_step} | Val: {val_loss:.6f} | Train loss: {last_loss:.4f} | "
-              f"Grad norm: {last_grad_norm:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e} | "
-              f"Speed: {last_speed:.2f} it/s")
-        reconstruct_samples(model, val_loader, device, global_step,
-                            out_dir=reconstruction_dir)
-        ema.restore(model)
+        skip_val = config.get("skip_val", False)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_loss, config,
-                            os.path.join(checkpoint_dir, "best.pt"))
-            print(f"  New best val loss: {val_loss:.6f}")
+        val_loss = None
+        if not skip_val:
+            ema.apply(model)
+            val_loss = evaluate(model, val_loader, device)
+            wandb.log({"val/loss": val_loss, "step": global_step})
+            print(f"  Step {global_step} | Val: {val_loss:.6f} | Train loss: {last_loss:.4f} | "
+                  f"Grad norm: {last_grad_norm:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e} | "
+                  f"Speed: {last_speed:.2f} it/s")
+            reconstruct_samples(model, val_loader, device, global_step,
+                                out_dir=reconstruction_dir)
+            ema.restore(model)
 
-        save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_loss, config,
-                        os.path.join(checkpoint_dir, "latest.pt"))
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch, val_loss, config,
+                                os.path.join(checkpoint_dir, "best.pt"))
+                print(f"  New best val loss: {val_loss:.6f}")
+        else:
+            print(f"  Step {global_step} | Train loss: {last_loss:.4f} | "
+                  f"Grad norm: {last_grad_norm:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e} | "
+                  f"Speed: {last_speed:.2f} it/s (val skipped)")
+
+        checkpoint_every = config.get("checkpoint_every", config["eval_every"])
+        if global_step % checkpoint_every == 0:
+            save_checkpoint(model, optimizer, scheduler, ema, global_step, epoch,
+                            val_loss if val_loss is not None else -1, config,
+                            os.path.join(checkpoint_dir, "latest.pt"))
         model.train()
 
     last_loss, last_grad_norm, last_speed = 0.0, 0.0, 0.0
@@ -327,6 +349,8 @@ def main():
         "ema_decay": 0.999,
         "warmup_epochs": 0.5,
         "eval_every": 500,
+        "checkpoint_every": 500,
+        "skip_val": True,
         "max_token_len": 2048,
     }
 
@@ -344,11 +368,15 @@ def main():
         reconstruction_dir = checkpoint_dir.replace("checkpoints", "reconstructions")
         print(f"Resuming from {resume_path}")
 
+    print("[startup] Initializing wandb...")
     wandb.init(project="svg-diffusion", config=config,
                resume="allow" if resume_path else None)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[startup] Device: {device}")
+    print("[startup] Setting up tokenizer...")
     tokenizer = setup_tokenizer(config["model_name"])
 
+    print("[startup] Loading dataset...")
     # Load dataset with no sequence-length truncation, skip overly long SVGs
     full_loader = create_dataloader(
         tokenizer,
@@ -370,7 +398,9 @@ def main():
 
     print(f"Train: {train_size} samples ({len(train_loader)} batches) | Val: {val_size} samples ({len(val_loader)} batches)")
 
+    print("[startup] Creating model...")
     model = SVGDiffusionModel(config["model_name"], tokenizer, lora_r=config["lora_r"], lora_alpha=config["lora_alpha"], lora_targets=config["lora_targets"]).to(device)
+    print("[startup] Creating optimizer...")
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=config["lr"], weight_decay=config["weight_decay"])
 
     # Cosine annealing with linear warmup (counted in optimizer steps, not samples)
@@ -383,10 +413,14 @@ def main():
 
     if resume_path:
         # No warmup when resuming — just cosine from current position
+        print("[startup] Creating scheduler (cosine, no warmup)...")
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
+        print(f"[startup] Loading checkpoint from {resume_path}...")
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        print("[startup] Loading model state dict...")
         model.load_state_dict(ckpt["model_state_dict"])
+        print("[startup] Loading optimizer state dict...")
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         # Don't load old scheduler state — we're using a fresh cosine-only scheduler
         if "ema_shadow" in ckpt:
@@ -395,8 +429,11 @@ def main():
         else:
             ema = EMA(model, decay=config["ema_decay"])
         start_step = ckpt.get("global_step", 0)
-        start_epoch = ckpt.get("epoch", 0)
-        print(f"Resumed: step={start_step}, epoch={start_epoch}, val_loss={ckpt.get('val_loss', 'N/A')}")
+        # Old checkpoints stored global_step in the "epoch" field, so don't
+        # trust it — always restart epoch counting from 0 and rely on
+        # global_step for progress tracking.
+        start_epoch = 0
+        print(f"Resumed: step={start_step}, val_loss={ckpt.get('val_loss', 'N/A')}")
     else:
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, total_iters=warmup_steps)
         cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
@@ -410,10 +447,13 @@ def main():
                 "lr": config["lr"],
                 "grad_clip": config["grad_clip"],
                 "eval_every": config["eval_every"],
+                "checkpoint_every": config["checkpoint_every"],
+                "skip_val": config["skip_val"],
                 "ema_decay": config["ema_decay"],
             }, f, default_flow_style=False)
         print(f"Created {LIVE_CONFIG_PATH} — edit to adjust hyperparameters on the fly")
 
+    print("[startup] Starting training loop...")
     wandb.watch(model, log="gradients", log_freq=50)
     train(model, train_loader, val_loader, optimizer, scheduler, ema, device,
           config=config, epochs=config["epochs"], checkpoint_dir=checkpoint_dir,
