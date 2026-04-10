@@ -6,6 +6,10 @@ dist/
 build/
 
 *.log
+*.pt
+
+classifier_parameters/
+classifier_plots/
 
 checkpoints/
 

@@ -270,6 +270,6 @@ if __name__ == "__main__":
 
     plt.suptitle("Original vs Reconstructed SVGs", fontsize=12)
     plt.tight_layout()
-    plt.savefig("example_svgs.png", dpi=150)
+    plt.savefig("example_svgs.png", dpi=1500)
     print("Saved plot to example_svgs.png")
     plt.show()
