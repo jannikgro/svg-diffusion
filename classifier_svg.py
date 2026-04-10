@@ -47,7 +47,10 @@ def load_one_svg(skip=0):
 
 
 def load_svgs(n, skip=0):
-    """Fetch up to n raw (svg_xml, description) pairs from the dataset.
+    """Fetch raw (svg_xml, description) pairs from the dataset.
+
+    If n is None, returns every distinct SVG in the dataset. Otherwise stops
+    after n and raises if fewer are available.
 
     The dataset is SFT-style: the same SVG often appears in several consecutive
     entries paired with different input prompts. We dedupe on the SVG body so
@@ -72,9 +75,11 @@ def load_svgs(n, skip=0):
             continue
         seen.add(key)
         out.append((svg, item.get("input", "")))
-        if len(out) >= n:
+        if n is not None and len(out) >= n:
             return out
-    raise RuntimeError(f"Only found {len(out)} SVGs, wanted {n}")
+    if n is not None and len(out) < n:
+        raise RuntimeError(f"Only found {len(out)} SVGs, wanted {n}")
+    return out
 
 
 def rasterize_svg_mask(svg_xml, size):
@@ -389,14 +394,16 @@ def run_single_svg():
 
 
 def main():
-    """Train the classifier on 32 SVGs (in chunks of 8 trained in parallel),
-    save plots to classifier_plots/, parameters to classifier_parameters/,
-    and log to wandb."""
+    """Train one tiny classifier per SVG, over the entire dataset, in chunks
+    trained in parallel. Parameters are saved to classifier_parameters/ for
+    every SVG; per-SVG visualization plots (and the combined grid / loss
+    curves / accuracy bar chart) are only produced for the first PLOT_LIMIT
+    SVGs, since the dataset is too large to reasonably visualize all of them."""
     os.makedirs(PLOTS_DIR, exist_ok=True)
     os.makedirs(PARAMS_DIR, exist_ok=True)
 
-    n_svgs = 32
-    chunk_size = 8
+    PLOT_LIMIT = 500
+    chunk_size = 32
     steps = 20000
     batch_size = 2**16
     lr = 1e-3
@@ -404,8 +411,18 @@ def main():
     plot_resolution = 512
     mask_resolution = 4096
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    print("Loading all SVGs from dataset (this may take a while)...")
+    svgs = load_svgs(n=None, skip=10)
+    n_svgs = len(svgs)
+    n_plots = min(n_svgs, PLOT_LIMIT)
+    print(f"Loaded {n_svgs} SVGs (plotting first {n_plots})")
+
     config = {
         "n_svgs": n_svgs,
+        "plot_limit": PLOT_LIMIT,
         "chunk_size": chunk_size,
         "steps": steps,
         "batch_size": batch_size,
@@ -417,27 +434,22 @@ def main():
     wandb.init(project="svg_classifier", config=config)
 
     # Custom step axis per SVG so each learning curve plots cleanly in wandb.
-    for i in range(n_svgs):
-        prefix = f"svg_{i:02d}"
+    # Only defined for the SVGs we actually stream per-step curves for.
+    for i in range(n_plots):
+        prefix = f"svg_{i:06d}"
         wandb.define_metric(f"{prefix}/step")
         wandb.define_metric(f"{prefix}/*", step_metric=f"{prefix}/step")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    print(f"Loading {n_svgs} SVGs from dataset...")
-    svgs = load_svgs(n_svgs, skip=10)
-
     final_accs = [None] * n_svgs
     inside_fractions = [None] * n_svgs
-    all_losses = [None] * n_svgs
-    cached_results = [None] * n_svgs  # (svg_img, probs, description)
+    all_losses = [None] * n_plots  # only kept for SVGs we plot
+    cached_results = [None] * n_plots  # (svg_img, probs, description) for first n_plots
 
     for chunk_start in range(0, n_svgs, chunk_size):
         chunk = svgs[chunk_start:chunk_start + chunk_size]
         B = len(chunk)
         chunk_indices = list(range(chunk_start, chunk_start + B))
-        prefixes = [f"svg_{i:02d}" for i in chunk_indices]
+        prefixes = [f"svg_{i:06d}" for i in chunk_indices]
         print(f"\n=== Chunk {chunk_start // chunk_size + 1}: training {B} models in parallel "
               f"({prefixes[0]}..{prefixes[-1]}) ===")
 
@@ -450,11 +462,15 @@ def main():
             masks_np.append(mask)
         masks_tensor = torch.from_numpy(np.stack(masks_np)).to(device)
 
+        # Only stream per-step training curves to wandb for chunks that
+        # contain SVGs within the plot limit.
+        log_curves = chunk_start < n_plots
+
         model = BatchedPointClassifier(n_models=B, hidden=hidden).to(device)
         model, losses_per_model = batched_train(
             model, masks_tensor,
             steps=steps, batch_size=batch_size, lr=lr,
-            wandb_prefixes=prefixes,
+            wandb_prefixes=prefixes if log_curves else None,
         )
 
         # Final accuracies on a fresh random sample, computed in parallel.
@@ -467,8 +483,11 @@ def main():
                 (torch.sigmoid(test_logits) > 0.5).float() == test_labels
             ).float().mean(dim=1).cpu().tolist()
 
-        # Evaluate the visualization grid for all heads in one shot.
-        probs_batch = batched_evaluate_grid(model, size=plot_resolution, device=device)
+        # Only evaluate the visualization grid if any SVG in this chunk is
+        # within the plot limit.
+        probs_batch = None
+        if log_curves:
+            probs_batch = batched_evaluate_grid(model, size=plot_resolution, device=device)
 
         for j in range(B):
             global_idx = chunk_indices[j]
@@ -476,22 +495,12 @@ def main():
             svg_xml, description = chunk[j]
             test_acc = test_acc_per_model[j]
             losses = losses_per_model[j]
-            probs = probs_batch[j]
 
             final_accs[global_idx] = test_acc
-            all_losses[global_idx] = losses
             print(f"  {prefix}  final_acc={test_acc:.4f}")
 
-            svg_img = render_svg_to_image(svg_xml, plot_resolution)
-            cached_results[global_idx] = (svg_img, probs, description)
-
-            fig, _ = plot_svg_and_prediction(svg_img, probs, description)
-            fig.tight_layout()
-            out_path = os.path.join(PLOTS_DIR, f"{prefix}.png")
-            fig.savefig(out_path, dpi=150)
-            print(f"  saved {out_path}")
-
-            # Save this head's weights as a loadable PointClassifier state dict.
+            # Save this head's weights as a loadable PointClassifier state dict
+            # for EVERY SVG (not just the plotted ones).
             ckpt_path = os.path.join(PARAMS_DIR, f"{prefix}.pt")
             torch.save(
                 {
@@ -503,38 +512,56 @@ def main():
                 },
                 ckpt_path,
             )
-            print(f"  saved {ckpt_path}")
 
-            wandb.log({
-                f"{prefix}/result": wandb.Image(fig),
-                f"{prefix}/final_acc": test_acc,
-                f"{prefix}/inside_fraction": inside_fractions[global_idx],
-            })
-            plt.close(fig)
+            # Per-SVG 2-panel plot + combined-grid cache only for the first
+            # PLOT_LIMIT SVGs.
+            if global_idx < n_plots:
+                all_losses[global_idx] = losses
+                probs = probs_batch[j]
+                svg_img = render_svg_to_image(svg_xml, plot_resolution)
+                cached_results[global_idx] = (svg_img, probs, description)
+
+                fig, _ = plot_svg_and_prediction(svg_img, probs, description)
+                fig.tight_layout()
+                out_path = os.path.join(PLOTS_DIR, f"{prefix}.png")
+                fig.savefig(out_path, dpi=150)
+                print(f"  saved {out_path}")
+
+                wandb.log({
+                    f"{prefix}/result": wandb.Image(fig),
+                    f"{prefix}/final_acc": test_acc,
+                    f"{prefix}/inside_fraction": inside_fractions[global_idx],
+                })
+                plt.close(fig)
 
         # Free per-chunk GPU memory before the next chunk.
-        del model, masks_tensor, test_xy, test_labels, test_logits, probs_batch
+        del model, masks_tensor, test_xy, test_labels, test_logits
+        if probs_batch is not None:
+            del probs_batch
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    # Combined grid of (svg, prediction) pairs. `pairs_per_row` pairs per row,
-    # each pair occupying two adjacent cells.
+    # Combined grid of (svg, prediction) pairs for the first n_plots SVGs.
+    # `pairs_per_row` pairs per row, each pair occupying two adjacent cells.
     pairs_per_row = 4
-    n_rows = (n_svgs + pairs_per_row - 1) // pairs_per_row
+    n_rows = (n_plots + pairs_per_row - 1) // pairs_per_row
     n_cols = pairs_per_row * 2
     grid_fig, grid_axes = plt.subplots(
         n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows)
     )
     if n_rows == 1:
         grid_axes = grid_axes[np.newaxis, :]
-    for i, (svg_img, probs, description) in enumerate(cached_results):
+    for i, entry in enumerate(cached_results):
+        if entry is None:
+            continue
+        svg_img, probs, description = entry
         row = i // pairs_per_row
         col_pair = (i % pairs_per_row) * 2
         ax_svg = grid_axes[row, col_pair]
         ax_pred = grid_axes[row, col_pair + 1]
         ax_svg.imshow(svg_img, extent=[0.0, 1.0, 1.0, 0.0])
         title = description[:40] + ("..." if len(description) > 40 else "")
-        ax_svg.set_title(f"svg_{i:02d}\n{title}", fontsize=8)
+        ax_svg.set_title(f"svg_{i:06d}\n{title}", fontsize=8)
         ax_svg.set_aspect("equal")
         ax_svg.set_xticks([])
         ax_svg.set_yticks([])
@@ -556,16 +583,18 @@ def main():
     wandb.log({"all_results": wandb.Image(grid_fig)})
     plt.close(grid_fig)
 
-    # Combined loss curves (log scale).
+    # Combined loss curves (log scale) for the first n_plots SVGs. With
+    # hundreds of curves a legend is useless, so we omit it beyond a threshold.
     loss_fig, loss_ax = plt.subplots(figsize=(8, 5))
     for i, losses in enumerate(all_losses):
-        loss_ax.plot(losses, linewidth=0.6, alpha=0.75, label=f"svg_{i:02d}")
+        if losses is None:
+            continue
+        loss_ax.plot(losses, linewidth=0.4, alpha=0.5)
     loss_ax.set_yscale("log")
     loss_ax.set_xlabel("step")
     loss_ax.set_ylabel("BCE loss (log)")
-    loss_ax.set_title("Training loss curves")
+    loss_ax.set_title(f"Training loss curves (first {n_plots} SVGs)")
     loss_ax.grid(True, which="both", linestyle=":", alpha=0.5)
-    loss_ax.legend(fontsize=7, ncol=2)
     loss_fig.tight_layout()
     loss_path = os.path.join(PLOTS_DIR, "loss_curves.png")
     loss_fig.savefig(loss_path, dpi=150)
@@ -573,17 +602,18 @@ def main():
     wandb.log({"loss_curves": wandb.Image(loss_fig)})
     plt.close(loss_fig)
 
-    # Final accuracy bar chart.
-    acc_fig, acc_ax = plt.subplots(figsize=(max(8, 0.3 * n_svgs), 4))
-    acc_ax.bar(range(n_svgs), final_accs, color="steelblue")
-    acc_ax.set_xticks(range(n_svgs))
-    acc_ax.set_xticklabels([f"{i:02d}" for i in range(n_svgs)], fontsize=7, rotation=90)
+    # Final accuracy bar chart for the first n_plots SVGs.
+    plotted_accs = final_accs[:n_plots]
+    acc_fig, acc_ax = plt.subplots(figsize=(min(40, max(8, 0.03 * n_plots)), 4))
+    acc_ax.bar(range(n_plots), plotted_accs, color="steelblue", width=1.0)
+    acc_ax.set_xlim(-0.5, n_plots - 0.5)
     acc_ax.set_xlabel("SVG index")
     acc_ax.set_ylabel("final accuracy")
     acc_ax.set_ylim(0.0, 1.0)
-    acc_ax.axhline(np.mean(final_accs), color="black", linestyle="--",
-                   label=f"mean={np.mean(final_accs):.3f}")
-    acc_ax.set_title("Final accuracy per SVG")
+    mean_plotted = float(np.mean(plotted_accs))
+    acc_ax.axhline(mean_plotted, color="black", linestyle="--",
+                   label=f"mean={mean_plotted:.3f}")
+    acc_ax.set_title(f"Final accuracy per SVG (first {n_plots})")
     acc_ax.legend()
     acc_ax.grid(True, axis="y", linestyle=":", alpha=0.5)
     acc_fig.tight_layout()
@@ -598,7 +628,7 @@ def main():
     })
     plt.close(acc_fig)
 
-    # Summary table of per-SVG metrics.
+    # Summary table of per-SVG metrics (covers all SVGs, not just plotted).
     table = wandb.Table(columns=["svg_idx", "description", "inside_fraction", "final_acc"])
     for i, (_, description) in enumerate(svgs):
         table.add_data(i, description[:120], inside_fractions[i], final_accs[i])
