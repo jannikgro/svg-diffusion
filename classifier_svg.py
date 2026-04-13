@@ -10,6 +10,7 @@ We work in the normalized canvas space [0, 1]^2 (with x to the right and y
 downward, matching screen / raster coordinates).
 """
 
+import argparse
 import io
 import math
 import os
@@ -79,6 +80,43 @@ def load_svgs(n, skip=0):
             return out
     if n is not None and len(out) < n:
         raise RuntimeError(f"Only found {len(out)} SVGs, wanted {n}")
+    return out
+
+
+def load_svgs_range(start_index, end_index):
+    """Fetch distinct SVGs at dedup positions [start_index, end_index).
+
+    Streams the dataset, dedupes on the SVG body, and keeps only the slice of
+    distinct SVGs whose dedup index falls within [start_index, end_index).
+    Raises if the dataset runs out before reaching start_index.
+    """
+    ds = load_dataset(
+        "xingxm/SVGX-SFT-1M",
+        split="train",
+        data_files="SVGX_SFT_GEN_51k.json",
+        streaming=True,
+    )
+    out = []
+    seen = set()
+    dedup_idx = 0
+    for item in ds:
+        svg = item.get("output", "")
+        if not svg.strip().startswith("<svg"):
+            continue
+        key = svg.strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        if dedup_idx >= start_index:
+            out.append((svg, item.get("input", "")))
+        dedup_idx += 1
+        if dedup_idx >= end_index:
+            break
+    if dedup_idx < start_index:
+        raise RuntimeError(
+            f"Dataset exhausted at dedup_idx={dedup_idx}, never reached "
+            f"start_index={start_index}"
+        )
     return out
 
 
@@ -394,16 +432,35 @@ def run_single_svg():
 
 
 def main():
-    """Train one tiny classifier per SVG, over the entire dataset, in chunks
+    """Train one tiny classifier per SVG over a slice of the dataset, in chunks
     trained in parallel. Parameters are saved to classifier_parameters/ for
-    every SVG; per-SVG visualization plots (and the combined grid / loss
-    curves / accuracy bar chart) are only produced for the first PLOT_LIMIT
-    SVGs, since the dataset is too large to reasonably visualize all of them."""
+    every SVG in the slice; per-SVG visualization plots (and the combined grid
+    / loss curves / accuracy bar chart) are only produced for the first
+    --plot_limit SVGs of the slice.
+
+    The slice is controlled by --start_index / --end_index, which refer to
+    positions in the deduplicated SVG stream. All saved files (checkpoints,
+    plots, wandb metric namespaces) use the global index, so runs over
+    disjoint slices can safely share output directories.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_index", type=int, default=0,
+                        help="Inclusive start dedup index (global).")
+    parser.add_argument("--end_index", type=int, default=None,
+                        help="Exclusive end dedup index (global). "
+                             "If omitted, processes to end of dataset.")
+    parser.add_argument("--plot_limit", type=int, default=0,
+                        help="Number of SVGs (from the start of the slice) "
+                             "to produce visualization plots for.")
+    args = parser.parse_args()
+
     os.makedirs(PLOTS_DIR, exist_ok=True)
     os.makedirs(PARAMS_DIR, exist_ok=True)
 
-    PLOT_LIMIT = 500
-    chunk_size = 32
+    start_index = args.start_index
+    end_index = args.end_index
+    plot_limit = args.plot_limit
+    chunk_size = 128
     steps = 20000
     batch_size = 2**16
     lr = 1e-3
@@ -414,15 +471,21 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    print("Loading all SVGs from dataset (this may take a while)...")
-    svgs = load_svgs(n=None, skip=10)
+    if end_index is None:
+        print(f"Loading SVGs from dedup index {start_index} to end of dataset...")
+        svgs = load_svgs_range(start_index=start_index, end_index=2**62)
+    else:
+        print(f"Loading SVGs from dedup index {start_index} to {end_index}...")
+        svgs = load_svgs_range(start_index=start_index, end_index=end_index)
     n_svgs = len(svgs)
-    n_plots = min(n_svgs, PLOT_LIMIT)
+    n_plots = min(n_svgs, plot_limit)
     print(f"Loaded {n_svgs} SVGs (plotting first {n_plots})")
 
     config = {
+        "start_index": start_index,
+        "end_index": end_index,
         "n_svgs": n_svgs,
-        "plot_limit": PLOT_LIMIT,
+        "plot_limit": plot_limit,
         "chunk_size": chunk_size,
         "steps": steps,
         "batch_size": batch_size,
@@ -435,8 +498,8 @@ def main():
 
     # Custom step axis per SVG so each learning curve plots cleanly in wandb.
     # Only defined for the SVGs we actually stream per-step curves for.
-    for i in range(n_plots):
-        prefix = f"svg_{i:06d}"
+    for local_i in range(n_plots):
+        prefix = f"svg_{start_index + local_i:06d}"
         wandb.define_metric(f"{prefix}/step")
         wandb.define_metric(f"{prefix}/*", step_metric=f"{prefix}/step")
 
@@ -448,22 +511,44 @@ def main():
     for chunk_start in range(0, n_svgs, chunk_size):
         chunk = svgs[chunk_start:chunk_start + chunk_size]
         B = len(chunk)
-        chunk_indices = list(range(chunk_start, chunk_start + B))
+        # Local indices into svgs / final_accs / etc.
+        chunk_local_indices = list(range(chunk_start, chunk_start + B))
+        # Global dedup indices, used for filenames and wandb prefixes.
+        chunk_indices = [start_index + j for j in chunk_local_indices]
         prefixes = [f"svg_{i:06d}" for i in chunk_indices]
         print(f"\n=== Chunk {chunk_start // chunk_size + 1}: training {B} models in parallel "
               f"({prefixes[0]}..{prefixes[-1]}) ===")
 
         masks_np = []
+        kept = []  # indices into the original chunk that rasterized successfully
         for j, (svg_xml, description) in enumerate(chunk):
-            mask = rasterize_svg_mask(svg_xml, size=mask_resolution)
+            try:
+                mask = rasterize_svg_mask(svg_xml, size=mask_resolution)
+            except Exception as e:
+                print(f"  {prefixes[j]}  SKIP (rasterize failed: {type(e).__name__}: {e})")
+                continue
             inside_fraction = float(mask.mean())
-            inside_fractions[chunk_indices[j]] = inside_fraction
+            inside_fractions[chunk_local_indices[j]] = inside_fraction
             print(f"  {prefixes[j]}  inside_frac={inside_fraction:.3f}  {description[:70]}")
             masks_np.append(mask)
+            kept.append(j)
+
+        if not kept:
+            print(f"  (entire chunk failed to rasterize, skipping)")
+            continue
+
+        # Drop the failed entries from all per-chunk lists so indices stay aligned.
+        chunk = [chunk[j] for j in kept]
+        prefixes = [prefixes[j] for j in kept]
+        chunk_local_indices = [chunk_local_indices[j] for j in kept]
+        chunk_indices = [chunk_indices[j] for j in kept]
+        B = len(chunk)
+
         masks_tensor = torch.from_numpy(np.stack(masks_np)).to(device)
 
         # Only stream per-step training curves to wandb for chunks that
-        # contain SVGs within the plot limit.
+        # contain SVGs within the plot limit (plot_limit counts from the
+        # start of this slice, not from global index 0).
         log_curves = chunk_start < n_plots
 
         model = BatchedPointClassifier(n_models=B, hidden=hidden).to(device)
@@ -490,13 +575,14 @@ def main():
             probs_batch = batched_evaluate_grid(model, size=plot_resolution, device=device)
 
         for j in range(B):
+            local_idx = chunk_local_indices[j]
             global_idx = chunk_indices[j]
             prefix = prefixes[j]
             svg_xml, description = chunk[j]
             test_acc = test_acc_per_model[j]
             losses = losses_per_model[j]
 
-            final_accs[global_idx] = test_acc
+            final_accs[local_idx] = test_acc
             print(f"  {prefix}  final_acc={test_acc:.4f}")
 
             # Save this head's weights as a loadable PointClassifier state dict
@@ -508,18 +594,18 @@ def main():
                     "hidden": hidden,
                     "description": description,
                     "final_acc": test_acc,
-                    "inside_fraction": inside_fractions[global_idx],
+                    "inside_fraction": inside_fractions[local_idx],
                 },
                 ckpt_path,
             )
 
             # Per-SVG 2-panel plot + combined-grid cache only for the first
-            # PLOT_LIMIT SVGs.
-            if global_idx < n_plots:
-                all_losses[global_idx] = losses
+            # plot_limit SVGs of this slice.
+            if local_idx < n_plots:
+                all_losses[local_idx] = losses
                 probs = probs_batch[j]
                 svg_img = render_svg_to_image(svg_xml, plot_resolution)
-                cached_results[global_idx] = (svg_img, probs, description)
+                cached_results[local_idx] = (svg_img, probs, description)
 
                 fig, _ = plot_svg_and_prediction(svg_img, probs, description)
                 fig.tight_layout()
@@ -530,7 +616,7 @@ def main():
                 wandb.log({
                     f"{prefix}/result": wandb.Image(fig),
                     f"{prefix}/final_acc": test_acc,
-                    f"{prefix}/inside_fraction": inside_fractions[global_idx],
+                    f"{prefix}/inside_fraction": inside_fractions[local_idx],
                 })
                 plt.close(fig)
 
@@ -541,101 +627,122 @@ def main():
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    # Combined grid of (svg, prediction) pairs for the first n_plots SVGs.
-    # `pairs_per_row` pairs per row, each pair occupying two adjacent cells.
-    pairs_per_row = 4
-    n_rows = (n_plots + pairs_per_row - 1) // pairs_per_row
-    n_cols = pairs_per_row * 2
-    grid_fig, grid_axes = plt.subplots(
-        n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows)
-    )
-    if n_rows == 1:
-        grid_axes = grid_axes[np.newaxis, :]
-    for i, entry in enumerate(cached_results):
-        if entry is None:
-            continue
-        svg_img, probs, description = entry
-        row = i // pairs_per_row
-        col_pair = (i % pairs_per_row) * 2
-        ax_svg = grid_axes[row, col_pair]
-        ax_pred = grid_axes[row, col_pair + 1]
-        ax_svg.imshow(svg_img, extent=[0.0, 1.0, 1.0, 0.0])
-        title = description[:40] + ("..." if len(description) > 40 else "")
-        ax_svg.set_title(f"svg_{i:06d}\n{title}", fontsize=8)
-        ax_svg.set_aspect("equal")
-        ax_svg.set_xticks([])
-        ax_svg.set_yticks([])
-        ax_pred.imshow(
-            probs, cmap="RdBu_r", vmin=0.0, vmax=1.0,
-            origin="upper", extent=[0.0, 1.0, 1.0, 0.0],
+    # Filename suffix so parallel slices can coexist in the same output dirs.
+    slice_suffix = f"_{start_index:06d}_{start_index + n_svgs:06d}"
+
+    if n_plots > 0:
+        # Combined grid of (svg, prediction) pairs for the first n_plots SVGs
+        # of this slice. `pairs_per_row` pairs per row, each pair occupying two
+        # adjacent cells.
+        pairs_per_row = 4
+        n_rows = (n_plots + pairs_per_row - 1) // pairs_per_row
+        n_cols = pairs_per_row * 2
+        grid_fig, grid_axes = plt.subplots(
+            n_rows, n_cols, figsize=(2.6 * n_cols, 2.8 * n_rows)
         )
-        xx = np.linspace(0.0, 1.0, probs.shape[1])
-        yy = np.linspace(0.0, 1.0, probs.shape[0])
-        ax_pred.contour(xx, yy, probs, levels=[0.5], colors="black", linewidths=1.0)
-        ax_pred.set_title(f"acc={final_accs[i]:.3f}", fontsize=8)
-        ax_pred.set_aspect("equal")
-        ax_pred.set_xticks([])
-        ax_pred.set_yticks([])
-    grid_fig.tight_layout()
-    grid_path = os.path.join(PLOTS_DIR, "all_results.png")
-    grid_fig.savefig(grid_path, dpi=120)
-    print(f"\nSaved combined grid to {grid_path}")
-    wandb.log({"all_results": wandb.Image(grid_fig)})
-    plt.close(grid_fig)
+        if n_rows == 1:
+            grid_axes = grid_axes[np.newaxis, :]
+        for local_i, entry in enumerate(cached_results):
+            if entry is None:
+                continue
+            svg_img, probs, description = entry
+            global_i = start_index + local_i
+            row = local_i // pairs_per_row
+            col_pair = (local_i % pairs_per_row) * 2
+            ax_svg = grid_axes[row, col_pair]
+            ax_pred = grid_axes[row, col_pair + 1]
+            ax_svg.imshow(svg_img, extent=[0.0, 1.0, 1.0, 0.0])
+            title = description[:40] + ("..." if len(description) > 40 else "")
+            ax_svg.set_title(f"svg_{global_i:06d}\n{title}", fontsize=8)
+            ax_svg.set_aspect("equal")
+            ax_svg.set_xticks([])
+            ax_svg.set_yticks([])
+            ax_pred.imshow(
+                probs, cmap="RdBu_r", vmin=0.0, vmax=1.0,
+                origin="upper", extent=[0.0, 1.0, 1.0, 0.0],
+            )
+            xx = np.linspace(0.0, 1.0, probs.shape[1])
+            yy = np.linspace(0.0, 1.0, probs.shape[0])
+            ax_pred.contour(xx, yy, probs, levels=[0.5], colors="black", linewidths=1.0)
+            ax_pred.set_title(f"acc={final_accs[local_i]:.3f}", fontsize=8)
+            ax_pred.set_aspect("equal")
+            ax_pred.set_xticks([])
+            ax_pred.set_yticks([])
+        grid_fig.tight_layout()
+        grid_path = os.path.join(PLOTS_DIR, f"all_results{slice_suffix}.png")
+        grid_fig.savefig(grid_path, dpi=120)
+        print(f"\nSaved combined grid to {grid_path}")
+        wandb.log({"all_results": wandb.Image(grid_fig)})
+        plt.close(grid_fig)
 
-    # Combined loss curves (log scale) for the first n_plots SVGs. With
-    # hundreds of curves a legend is useless, so we omit it beyond a threshold.
-    loss_fig, loss_ax = plt.subplots(figsize=(8, 5))
-    for i, losses in enumerate(all_losses):
-        if losses is None:
-            continue
-        loss_ax.plot(losses, linewidth=0.4, alpha=0.5)
-    loss_ax.set_yscale("log")
-    loss_ax.set_xlabel("step")
-    loss_ax.set_ylabel("BCE loss (log)")
-    loss_ax.set_title(f"Training loss curves (first {n_plots} SVGs)")
-    loss_ax.grid(True, which="both", linestyle=":", alpha=0.5)
-    loss_fig.tight_layout()
-    loss_path = os.path.join(PLOTS_DIR, "loss_curves.png")
-    loss_fig.savefig(loss_path, dpi=150)
-    print(f"Saved loss curves to {loss_path}")
-    wandb.log({"loss_curves": wandb.Image(loss_fig)})
-    plt.close(loss_fig)
+        # Combined loss curves (log scale) for the first n_plots SVGs. With
+        # hundreds of curves a legend is useless, so we omit it.
+        loss_fig, loss_ax = plt.subplots(figsize=(8, 5))
+        for losses in all_losses:
+            if losses is None:
+                continue
+            loss_ax.plot(losses, linewidth=0.4, alpha=0.5)
+        loss_ax.set_yscale("log")
+        loss_ax.set_xlabel("step")
+        loss_ax.set_ylabel("BCE loss (log)")
+        loss_ax.set_title(f"Training loss curves (first {n_plots} SVGs of slice)")
+        loss_ax.grid(True, which="both", linestyle=":", alpha=0.5)
+        loss_fig.tight_layout()
+        loss_path = os.path.join(PLOTS_DIR, f"loss_curves{slice_suffix}.png")
+        loss_fig.savefig(loss_path, dpi=150)
+        print(f"Saved loss curves to {loss_path}")
+        wandb.log({"loss_curves": wandb.Image(loss_fig)})
+        plt.close(loss_fig)
 
-    # Final accuracy bar chart for the first n_plots SVGs.
-    plotted_accs = final_accs[:n_plots]
-    acc_fig, acc_ax = plt.subplots(figsize=(min(40, max(8, 0.03 * n_plots)), 4))
-    acc_ax.bar(range(n_plots), plotted_accs, color="steelblue", width=1.0)
-    acc_ax.set_xlim(-0.5, n_plots - 0.5)
-    acc_ax.set_xlabel("SVG index")
-    acc_ax.set_ylabel("final accuracy")
-    acc_ax.set_ylim(0.0, 1.0)
-    mean_plotted = float(np.mean(plotted_accs))
-    acc_ax.axhline(mean_plotted, color="black", linestyle="--",
-                   label=f"mean={mean_plotted:.3f}")
-    acc_ax.set_title(f"Final accuracy per SVG (first {n_plots})")
-    acc_ax.legend()
-    acc_ax.grid(True, axis="y", linestyle=":", alpha=0.5)
-    acc_fig.tight_layout()
-    acc_path = os.path.join(PLOTS_DIR, "final_accuracies.png")
-    acc_fig.savefig(acc_path, dpi=150)
-    print(f"Saved accuracy bar chart to {acc_path}")
-    wandb.log({
-        "final_accuracies": wandb.Image(acc_fig),
-        "mean_final_acc": float(np.mean(final_accs)),
-        "min_final_acc": float(np.min(final_accs)),
-        "max_final_acc": float(np.max(final_accs)),
-    })
-    plt.close(acc_fig)
+        # Final accuracy bar chart for the first n_plots SVGs of this slice.
+        plotted_accs = [a if a is not None else 0.0 for a in final_accs[:n_plots]]
+        acc_fig, acc_ax = plt.subplots(figsize=(min(40, max(8, 0.03 * n_plots)), 4))
+        acc_ax.bar(range(n_plots), plotted_accs, color="steelblue", width=1.0)
+        acc_ax.set_xlim(-0.5, n_plots - 0.5)
+        acc_ax.set_xlabel("SVG index (within slice)")
+        acc_ax.set_ylabel("final accuracy")
+        acc_ax.set_ylim(0.0, 1.0)
+        valid_plotted = [a for a in plotted_accs if a > 0.0] or [0.0]
+        mean_plotted = float(np.mean(valid_plotted))
+        acc_ax.axhline(mean_plotted, color="black", linestyle="--",
+                       label=f"mean={mean_plotted:.3f}")
+        acc_ax.set_title(f"Final accuracy per SVG (first {n_plots} of slice)")
+        acc_ax.legend()
+        acc_ax.grid(True, axis="y", linestyle=":", alpha=0.5)
+        acc_fig.tight_layout()
+        acc_path = os.path.join(PLOTS_DIR, f"final_accuracies{slice_suffix}.png")
+        acc_fig.savefig(acc_path, dpi=150)
+        print(f"Saved accuracy bar chart to {acc_path}")
+        valid_accs = [a for a in final_accs if a is not None]
+        wandb.log({
+            "final_accuracies": wandb.Image(acc_fig),
+            "mean_final_acc": float(np.mean(valid_accs)) if valid_accs else 0.0,
+            "min_final_acc": float(np.min(valid_accs)) if valid_accs else 0.0,
+            "max_final_acc": float(np.max(valid_accs)) if valid_accs else 0.0,
+            "n_failed": len(final_accs) - len(valid_accs),
+        })
+        plt.close(acc_fig)
+    else:
+        valid_accs = [a for a in final_accs if a is not None]
+        wandb.log({
+            "mean_final_acc": float(np.mean(valid_accs)) if valid_accs else 0.0,
+            "min_final_acc": float(np.min(valid_accs)) if valid_accs else 0.0,
+            "max_final_acc": float(np.max(valid_accs)) if valid_accs else 0.0,
+            "n_failed": len(final_accs) - len(valid_accs),
+        })
 
-    # Summary table of per-SVG metrics (covers all SVGs, not just plotted).
+    # Summary table of per-SVG metrics (covers every SVG in the slice).
     table = wandb.Table(columns=["svg_idx", "description", "inside_fraction", "final_acc"])
-    for i, (_, description) in enumerate(svgs):
-        table.add_data(i, description[:120], inside_fractions[i], final_accs[i])
+    for local_i, (_, description) in enumerate(svgs):
+        global_i = start_index + local_i
+        table.add_data(global_i, description[:120], inside_fractions[local_i], final_accs[local_i])
     wandb.log({"summary": table})
 
     wandb.finish()
-    print(f"\nDone. mean final acc = {np.mean(final_accs):.4f}")
+    valid_accs_final = [a for a in final_accs if a is not None]
+    n_failed = len(final_accs) - len(valid_accs_final)
+    mean_acc = float(np.mean(valid_accs_final)) if valid_accs_final else 0.0
+    print(f"\nDone. mean final acc = {mean_acc:.4f} ({n_failed} SVGs failed to rasterize)")
 
 
 if __name__ == "__main__":

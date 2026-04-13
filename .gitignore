@@ -8,6 +8,8 @@ build/
 *.log
 *.pt
 
+*_to_*.sh
+
 classifier_parameters/
 classifier_plots/
 

@@ -2,5 +2,5 @@ checkpoint_every: 500
 ema_decay: 0.999
 eval_every: 500
 grad_clip: 1.0
-lr: 0.00015
+lr: 0.00045
 skip_val: true

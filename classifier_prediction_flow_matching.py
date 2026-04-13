@@ -299,8 +299,8 @@ def plot_sampled_classifiers(probs_batch, step, data_probs_batch=None):
 # ---------------------------------------------------------------------------
 
 def train_flow_matching(
-    steps=20000,
-    batch_size=24,
+    epochs=2000,
+    batch_size=32,
     lr=2e-4,
     weight_decay=1e-5,
     hidden=512,
@@ -308,8 +308,8 @@ def train_flow_matching(
     t_dim=128,
     dropout=0.0,
     ema_decay=0.999,
-    sample_every=1000,
-    log_every=50,
+    sample_every=100,
+    log_every=10,
     n_sample_steps=100,
     n_samples_to_plot=6,
     grid_size=128,
@@ -330,18 +330,30 @@ def train_flow_matching(
     N, P = data.shape
     print(f"Loaded {N} classifiers with {P} params each")
     assert P == TOTAL_PARAMS
-    # Per-dim normalization across the (admittedly tiny) dataset.
-    mean = data.mean(dim=0, keepdim=True)
-    std = data.std(dim=0, keepdim=True).clamp(min=1e-4)
-    data_n = ((data - mean) / std).to(device)
+
+    # Train/test split (80/20, at least 1 test sample).
+    perm = torch.randperm(N)
+    n_test = max(1, int(0.2 * N))
+    n_train = N - n_test
+    train_idx = perm[:n_train]
+    test_idx = perm[n_train:]
+    train_data = data[train_idx]
+    test_data = data[test_idx]
+    print(f"Train/test split: {n_train} train, {n_test} test")
+
+    # Per-dim normalization computed on training set only.
+    mean = train_data.mean(dim=0, keepdim=True)
+    std = train_data.std(dim=0, keepdim=True).clamp(min=1e-4)
+    train_n = ((train_data - mean) / std).to(device)
+    test_n = ((test_data - mean) / std).to(device)
     mean_dev = mean.to(device)
     std_dev = std.to(device)
 
     # Precompute a reference figure of a few training examples to anchor the
     # comparison in the periodic sample plots.
-    ref_idx = list(range(min(n_samples_to_plot, N)))
+    ref_idx = list(range(min(n_samples_to_plot, n_train)))
     data_probs_ref = materialize_and_evaluate(
-        data_n[ref_idx], mean_dev, std_dev, grid_size=grid_size, device=device,
+        train_n[ref_idx], mean_dev, std_dev, grid_size=grid_size, device=device,
     )
 
     # ----- model -----
@@ -378,7 +390,7 @@ def train_flow_matching(
     wandb.init(
         project=wandb_project,
         config={
-            "steps": steps,
+            "epochs": epochs,
             "batch_size": batch_size,
             "lr": lr,
             "weight_decay": weight_decay,
@@ -390,31 +402,54 @@ def train_flow_matching(
             "n_sample_steps": n_sample_steps,
             "grid_size": grid_size,
             "n_data": N,
+            "n_train": n_train,
+            "n_test": n_test,
             "param_dim": P,
             "model_params": n_model_params,
         },
     )
 
     # ----- training loop -----
+    n_test_evals = 8  # number of MC evaluations to average for test loss
+    global_step = 0
     model.train()
-    for step in range(1, steps + 1):
-        # With a tiny dataset (24), each "batch" is a random-with-replacement
-        # draw so the velocity target sees every sample many times per epoch.
-        idx = torch.randint(0, N, (batch_size,), device=device)
-        x1 = data_n[idx]
-        loss = flow_matching_loss(model, x1)
+    for epoch in range(1, epochs + 1):
+        # Shuffle training data each epoch and iterate in batches.
+        perm_epoch = torch.randperm(n_train, device=device)
+        epoch_losses = []
+        for i in range(0, n_train, batch_size):
+            idx = perm_epoch[i:i + batch_size]
+            x1 = train_n[idx]
+            loss = flow_matching_loss(model, x1)
 
-        opt.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        opt.step()
-        ema_update()
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step()
+            ema_update()
+            global_step += 1
+            epoch_losses.append(loss.item())
 
-        if step % log_every == 0 or step == 1:
-            wandb.log({"train/loss": loss.item(), "train/step": step}, step=step)
-            print(f"step {step:6d}  loss {loss.item():.5f}")
+        train_loss_avg = sum(epoch_losses) / len(epoch_losses)
 
-        if step % sample_every == 0 or step == steps:
+        if epoch % log_every == 0 or epoch == 1:
+            # Compute test loss (averaged over a few MC draws for stability).
+            model.eval()
+            with torch.no_grad():
+                test_losses = []
+                for _ in range(n_test_evals):
+                    test_loss = flow_matching_loss(model, test_n)
+                    test_losses.append(test_loss.item())
+                test_loss_avg = sum(test_losses) / len(test_losses)
+            model.train()
+            wandb.log({
+                "train/loss": train_loss_avg,
+                "test/loss": test_loss_avg,
+                "epoch": epoch,
+            }, step=global_step)
+            print(f"epoch {epoch:5d}  train {train_loss_avg:.5f}  test {test_loss_avg:.5f}")
+
+        if epoch % sample_every == 0 or epoch == epochs:
             def _sample_and_plot():
                 samples = sample(
                     model, n_samples_to_plot, n_sample_steps, device, param_dim=P,
@@ -427,13 +462,13 @@ def train_flow_matching(
             samples, probs_batch = with_ema_weights(_sample_and_plot)
 
             fig = plot_sampled_classifiers(
-                probs_batch, step=step, data_probs_batch=data_probs_ref,
+                probs_batch, step=epoch, data_probs_batch=data_probs_ref,
             )
-            out_path = os.path.join(PLOTS_DIR, f"samples_step_{step:07d}.png")
+            out_path = os.path.join(PLOTS_DIR, f"samples_epoch_{epoch:07d}.png")
             fig.savefig(out_path, dpi=120)
             print(f"  saved {out_path}")
-            wandb.log({"samples/figure": wandb.Image(fig), "train/step": step},
-                      step=step)
+            wandb.log({"samples/figure": wandb.Image(fig), "epoch": epoch},
+                      step=global_step)
             plt.close(fig)
 
             # Diagnostics: how far the sampled params drift from the data in
@@ -456,8 +491,8 @@ def train_flow_matching(
                 "samples/mean": s_mean,
                 "samples/std": s_std,
                 "samples/mean_pair_dist": mean_pair_dist,
-                "train/step": step,
-            }, step=step)
+                "epoch": epoch,
+            }, step=global_step)
 
             model.train()
 
