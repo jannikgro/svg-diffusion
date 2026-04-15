@@ -8,4 +8,4 @@
 #SBATCH --output=slurm-%j.log
 
 cd /home/jgroenev/repositories/svg_diffusion
-python classifier_prediction_flow_matching.py
+python classifier_prediction_flow_matching.py --resume flow_matching_plots/flow_model.pt --epochs 100000 --start-epoch 12000

@@ -328,6 +328,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint directory or .pt file to resume from")
+    parser.add_argument("--overfit", action="store_true",
+                        help="Overfit mode: train on 4x effective batch size, eval every 1000 steps")
     args = parser.parse_args()
 
     run_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
@@ -363,9 +365,6 @@ def main():
             resume_path = args.resume
         if not os.path.exists(resume_path):
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
-        # Use the original checkpoint dir when resuming
-        checkpoint_dir = os.path.dirname(resume_path)
-        reconstruction_dir = checkpoint_dir.replace("checkpoints", "reconstructions")
         print(f"Resuming from {resume_path}")
 
     print("[startup] Initializing wandb...")
@@ -388,9 +387,21 @@ def main():
     )
 
     dataset = full_loader.dataset
-    val_size = max(1, int(len(dataset) * config["val_split"]))
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+    if args.overfit:
+        overfit_size = 4 * config["accumulation_steps"]
+        overfit_size = min(overfit_size, len(dataset))
+        train_ds, _ = torch.utils.data.random_split(
+            dataset, [overfit_size, len(dataset) - overfit_size])
+        val_ds = train_ds  # validate on the same data to check memorisation
+        train_size, val_size = overfit_size, overfit_size
+        config["eval_every"] = 1000
+        config["checkpoint_every"] = 1000
+        print(f"[overfit] Using {overfit_size} samples (4x effective batch size)")
+    else:
+        val_size = max(1, int(len(dataset) * config["val_split"]))
+        train_size = len(dataset) - val_size
+        train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
 
     from prepare_dataset import collate_single
     train_loader = torch.utils.data.DataLoader(train_ds, batch_size=1, shuffle=True, collate_fn=collate_single)

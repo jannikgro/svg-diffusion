@@ -24,6 +24,7 @@ from noise, materialize them into fresh PointClassifier modules, evaluate
 them on a grid, and log the resulting probability maps to wandb.
 """
 
+import argparse
 import glob
 import math
 import os
@@ -316,10 +317,14 @@ def train_flow_matching(
     seed=0,
     device=None,
     wandb_project="svg_classifier_flow_matching",
+    resume=None,
+    start_epoch=0,
 ):
     os.makedirs(PLOTS_DIR, exist_ok=True)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # When resuming, perturb the seed so we don't replay the exact same noise.
+    effective_seed = seed + start_epoch
+    torch.manual_seed(effective_seed)
+    np.random.seed(effective_seed)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -369,6 +374,13 @@ def train_flow_matching(
     # Simple EMA of parameters for cleaner samples.
     ema = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
+    if resume is not None:
+        print(f"Resuming from {resume}")
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        ema = {k: v.to(device) for k, v in ckpt["ema_state_dict"].items()}
+        print(f"Loaded model + EMA from epoch {start_epoch}")
+
     def ema_update():
         with torch.no_grad():
             for k, v in model.state_dict().items():
@@ -413,7 +425,8 @@ def train_flow_matching(
     n_test_evals = 8  # number of MC evaluations to average for test loss
     global_step = 0
     model.train()
-    for epoch in range(1, epochs + 1):
+    final_epoch = start_epoch + epochs
+    for epoch in range(start_epoch + 1, final_epoch + 1):
         # Shuffle training data each epoch and iterate in batches.
         perm_epoch = torch.randperm(n_train, device=device)
         epoch_losses = []
@@ -432,7 +445,7 @@ def train_flow_matching(
 
         train_loss_avg = sum(epoch_losses) / len(epoch_losses)
 
-        if epoch % log_every == 0 or epoch == 1:
+        if epoch % log_every == 0 or epoch == start_epoch + 1:
             # Compute test loss (averaged over a few MC draws for stability).
             model.eval()
             with torch.no_grad():
@@ -449,7 +462,7 @@ def train_flow_matching(
             }, step=global_step)
             print(f"epoch {epoch:5d}  train {train_loss_avg:.5f}  test {test_loss_avg:.5f}")
 
-        if epoch % sample_every == 0 or epoch == epochs:
+        if epoch % sample_every == 0 or epoch == final_epoch:
             def _sample_and_plot():
                 samples = sample(
                     model, n_samples_to_plot, n_sample_steps, device, param_dim=P,
@@ -521,4 +534,16 @@ def train_flow_matching(
 
 
 if __name__ == "__main__":
-    train_flow_matching()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a flow_model.pt checkpoint to resume from")
+    parser.add_argument("--epochs", type=int, default=2000,
+                        help="Number of epochs to train (additional epochs when resuming)")
+    parser.add_argument("--start-epoch", type=int, default=0,
+                        help="Epoch number the resumed checkpoint left off at")
+    args = parser.parse_args()
+    train_flow_matching(
+        epochs=args.epochs,
+        resume=args.resume,
+        start_epoch=args.start_epoch,
+    )
