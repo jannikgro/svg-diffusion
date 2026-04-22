@@ -541,9 +541,11 @@ if __name__ == "__main__":
                         help="Number of epochs to train (additional epochs when resuming)")
     parser.add_argument("--start-epoch", type=int, default=0,
                         help="Epoch number the resumed checkpoint left off at")
+    parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
     train_flow_matching(
         epochs=args.epochs,
+        batch_size=args.batch_size,
         resume=args.resume,
         start_epoch=args.start_epoch,
     )
